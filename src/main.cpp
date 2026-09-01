@@ -1,7 +1,7 @@
+#include "kernels.cuh"
 #include "safetensor.hpp"
 
-#include <algorithm>
-#include <bit>
+#include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <filesystem>
@@ -12,6 +12,33 @@
 #include <vector>
 
 namespace {
+
+// CUDA helpers
+void cuda_check(cudaError_t status, std::string_view operation) {
+    if (status != cudaSuccess) {
+        throw std::runtime_error(std::string(operation) + ": " + cudaGetErrorString(status));
+    }
+}
+
+template <typename T>
+class DeviceBuffer {
+public:
+    explicit DeviceBuffer(std::size_t count) {
+        cuda_check(cudaMalloc(reinterpret_cast<void**>(&data_), count * sizeof(T)), "cudaMalloc");
+    }
+
+    ~DeviceBuffer() {
+        if (data_ != nullptr) cudaFree(data_);
+    }
+
+    DeviceBuffer(const DeviceBuffer&) = delete;
+    DeviceBuffer& operator=(const DeviceBuffer&) = delete;
+
+    [[nodiscard]] T* get() const { return data_; }
+
+private:
+    T* data_ = nullptr;
+};
 
 void print_shape(const std::vector<std::uint64_t>& shape) {
     std::cout << '[';
@@ -34,29 +61,6 @@ void print_shape(const std::vector<std::uint64_t>& shape) {
     return value;
 }
 
-[[nodiscard]] float bfloat16_to_float(const std::byte* source) {
-    const auto low = std::to_integer<std::uint8_t>(source[0]);
-    const auto high = std::to_integer<std::uint8_t>(source[1]);
-    const std::uint32_t bits = (static_cast<std::uint32_t>(high) << 24) |
-                               (static_cast<std::uint32_t>(low) << 16);
-    return std::bit_cast<float>(bits);
-}
-
-void print_embedding_preview(const std::vector<std::byte>& weights,
-                             std::uint64_t token_id,
-                             std::uint64_t hidden_size) {
-    constexpr std::uint64_t bfloat16_bytes = 2;
-    constexpr std::uint64_t preview_values = 8;
-    const auto row_offset = token_id * hidden_size * bfloat16_bytes;
-
-    std::cout << "token " << token_id << " -> [";
-    for (std::uint64_t dim = 0; dim < std::min(hidden_size, preview_values); ++dim) {
-        if (dim != 0) std::cout << ", ";
-        std::cout << bfloat16_to_float(weights.data() + row_offset + dim * bfloat16_bytes);
-    }
-    std::cout << ", ...]\n";
-}
-
 void print_usage(const char* program) {
     std::cerr << "Usage: " << program
               << " [--model PATH] --tokens TOKEN_ID [TOKEN_ID ...]\n";
@@ -65,6 +69,7 @@ void print_usage(const char* program) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    // Command-line input
     std::filesystem::path model_path = "models/Qwen3-0.6B/model.safetensors";
     std::vector<std::uint64_t> token_ids;
 
@@ -91,6 +96,7 @@ int main(int argc, char** argv) {
             return 1;
         }
 
+        // Model metadata and host data
         const inference::SafetensorFile model(model_path);
         constexpr char embedding_name[] = "model.embed_tokens.weight";
         const auto& embedding = model.tensor(embedding_name);
@@ -106,10 +112,13 @@ int main(int argc, char** argv) {
             throw std::runtime_error("Embedding tensor has an unexpected byte size");
         }
         for (const auto token_id : token_ids) {
-            if (token_id >= vocab_size) {
+            if (token_id >= vocab_size || token_id > std::numeric_limits<std::int32_t>::max()) {
                 throw std::out_of_range("Token ID " + std::to_string(token_id) +
                                         " is outside the vocabulary of " + std::to_string(vocab_size));
             }
+        }
+        if (token_ids.size() > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
+            throw std::runtime_error("Too many input tokens for the CUDA kernel");
         }
 
         std::cout << "Loaded " << model_path << " (" << model.tensors().size() << " tensors)\n";
@@ -117,12 +126,34 @@ int main(int argc, char** argv) {
         print_shape(embedding.shape);
         std::cout << ", bytes=" << embedding.byte_size() << '\n';
 
-        // This CPU reference gather will be replaced by a GPU kernel. Each token
-        // selects one contiguous row of [hidden_size] BF16 values.
         const auto weights = model.read_tensor(embedding_name);
+        std::vector<std::int32_t> host_token_ids;
+        host_token_ids.reserve(token_ids.size());
         for (const auto token_id : token_ids) {
-            print_embedding_preview(weights, token_id, hidden_size);
+            host_token_ids.push_back(static_cast<std::int32_t>(token_id));
         }
+
+        // Device buffers and H2D copies
+        const auto embedding_values = embedding.byte_size() / sizeof(__nv_bfloat16);
+        const auto output_values = host_token_ids.size() * static_cast<std::size_t>(hidden_size);
+        DeviceBuffer<__nv_bfloat16> device_embedding(embedding_values);
+        DeviceBuffer<std::int32_t> device_token_ids(host_token_ids.size());
+        DeviceBuffer<__nv_bfloat16> device_output(output_values);
+        cuda_check(cudaMemcpy(device_embedding.get(), weights.data(), weights.size(), cudaMemcpyHostToDevice),
+                   "cudaMemcpy embedding table H2D");
+        cuda_check(cudaMemcpy(device_token_ids.get(), host_token_ids.data(),
+                              host_token_ids.size() * sizeof(std::int32_t), cudaMemcpyHostToDevice),
+                   "cudaMemcpy token IDs H2D");
+
+        // Embedding gather launch
+        cuda_check(inference::launch_embedding_gather(
+                       device_embedding.get(), device_token_ids.get(), device_output.get(),
+                       static_cast<std::int32_t>(host_token_ids.size()),
+                       static_cast<std::int32_t>(hidden_size)),
+                   "launch_embedding_gather");
+        cuda_check(cudaDeviceSynchronize(), "cudaDeviceSynchronize");
+
+        std::cout << "Gathered " << host_token_ids.size() << " embedding row(s) on the GPU.\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "error: " << error.what() << '\n';
