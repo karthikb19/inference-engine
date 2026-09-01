@@ -1,2 +1,5 @@
 # Downloaded model weights are large, local-only artifacts.
 /models/
+
+# Local build artifacts.
+/build/
