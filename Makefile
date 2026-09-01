@@ -10,6 +10,8 @@ RMS_NORM_TEST_TARGET := build/rms_norm_test
 RMS_NORM_TEST_SOURCES := tests/rms_norm_test.cu src/kernels.cu
 ROPE_TEST_TARGET := build/rope_test
 ROPE_TEST_SOURCES := tests/rope_test.cu src/kernels.cu
+RESIDUAL_ADD_TEST_TARGET := build/residual_add_test
+RESIDUAL_ADD_TEST_SOURCES := tests/residual_add_test.cu src/kernels.cu
 TOKENS ?= 791
 
 .PHONY: all run test clean
@@ -35,10 +37,15 @@ $(ROPE_TEST_TARGET): $(ROPE_TEST_SOURCES) include/kernels.cuh
 	mkdir -p build
 	$(NVCC) -std=c++20 -arch=$(CUDA_ARCH) $(CPPFLAGS) $(ROPE_TEST_SOURCES) -o $@
 
-test: $(TEST_TARGET) $(RMS_NORM_TEST_TARGET) $(ROPE_TEST_TARGET)
+$(RESIDUAL_ADD_TEST_TARGET): $(RESIDUAL_ADD_TEST_SOURCES) include/kernels.cuh
+	mkdir -p build
+	$(NVCC) -std=c++20 -arch=$(CUDA_ARCH) $(CPPFLAGS) $(RESIDUAL_ADD_TEST_SOURCES) -o $@
+
+test: $(TEST_TARGET) $(RMS_NORM_TEST_TARGET) $(ROPE_TEST_TARGET) $(RESIDUAL_ADD_TEST_TARGET)
 	./$(TEST_TARGET)
 	./$(RMS_NORM_TEST_TARGET)
 	./$(ROPE_TEST_TARGET)
+	./$(RESIDUAL_ADD_TEST_TARGET)
 
 .PHONY: rms-norm-test
 rms-norm-test: $(RMS_NORM_TEST_TARGET)
@@ -47,6 +54,10 @@ rms-norm-test: $(RMS_NORM_TEST_TARGET)
 .PHONY: rope-test
 rope-test: $(ROPE_TEST_TARGET)
 	./$(ROPE_TEST_TARGET)
+
+.PHONY: residual-add-test
+residual-add-test: $(RESIDUAL_ADD_TEST_TARGET)
+	./$(RESIDUAL_ADD_TEST_TARGET)
 
 clean:
 	rm -rf build

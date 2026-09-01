@@ -62,4 +62,16 @@ cudaError_t launch_rope(const __nv_bfloat16* input,
                         std::int32_t head_dim,
                         cudaStream_t stream = nullptr);
 
+// In-place residual connection:
+//   input    <- input + residual
+//   input:      [num_tokens, hidden_size] __nv_bfloat16 values
+//   residual:   [num_tokens, hidden_size] __nv_bfloat16 values
+//
+// Addition is performed in FP32 before the result is rounded back to BF16.
+cudaError_t launch_residual_add(__nv_bfloat16* input,
+                                const __nv_bfloat16* residual,
+                                std::int32_t num_tokens,
+                                std::int32_t hidden_size,
+                                cudaStream_t stream = nullptr);
+
 }  // namespace inference

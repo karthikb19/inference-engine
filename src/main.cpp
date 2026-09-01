@@ -199,6 +199,10 @@ int main(int argc, char** argv) {
         // Apply the same operation to device_key with qwen_key_value_heads.
         // Build the shared cos/sin tables once from qwen_rope_theta; position
         // IDs must account for the number of tokens already in the KV cache.
+        // After attention's output projection, preserve device_output as the
+        // residual stream and add the projection in place:
+        //   launch_residual_add(device_output.get(), device_attention_output.get(),
+        //                       tokens, hidden_size);
         cuda_check(cudaDeviceSynchronize(), "cudaDeviceSynchronize");
 
         std::cout << "Gathered and RMS-normalized " << host_token_ids.size()

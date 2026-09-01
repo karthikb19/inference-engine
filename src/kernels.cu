@@ -1,5 +1,7 @@
 #include "kernels.cuh"
 
+#include <limits>
+
 namespace inference {
 
 // Embedding gather kernel
@@ -155,6 +157,37 @@ cudaError_t launch_rope(const __nv_bfloat16* input,
     const dim3 block(threads_per_block);
     rope_kernel<<<grid, block, 0, stream>>>(input, position_ids, cos, sin, output,
                                               num_tokens, num_heads, head_dim);
+    return cudaGetLastError();
+}
+
+__global__ void residual_add_kernel(__nv_bfloat16* input,
+                                    const __nv_bfloat16* residual,
+                                    std::int64_t total_elements) {
+    const std::int64_t index = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= total_elements) return;
+
+    const float input_value = __bfloat162float(input[index]);
+    const float residual_value = __bfloat162float(residual[index]);
+    input[index] = __float2bfloat16(input_value + residual_value);
+}
+
+cudaError_t launch_residual_add(__nv_bfloat16* input,
+                                const __nv_bfloat16* residual,
+                                std::int32_t num_tokens,
+                                std::int32_t hidden_size,
+                                cudaStream_t stream) {
+    if (input == nullptr || residual == nullptr || num_tokens <= 0 || hidden_size <= 0) {
+        return cudaErrorInvalidValue;
+    }
+
+    constexpr std::int32_t threads_per_block = 256;
+    const std::int64_t total_elements = static_cast<std::int64_t>(num_tokens) * hidden_size;
+    const std::int64_t blocks = (total_elements + threads_per_block - 1) / threads_per_block;
+    if (blocks > std::numeric_limits<unsigned int>::max()) return cudaErrorInvalidValue;
+
+    const dim3 grid(static_cast<unsigned int>(blocks));
+    const dim3 block(threads_per_block);
+    residual_add_kernel<<<grid, block, 0, stream>>>(input, residual, total_elements);
     return cudaGetLastError();
 }
 
