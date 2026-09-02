@@ -3,3 +3,7 @@
 
 # Local build artifacts.
 /build/
+
+# Local Python environments and bytecode.
+/.venv/
+__pycache__/

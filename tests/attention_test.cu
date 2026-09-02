@@ -140,6 +140,8 @@ void test_invalid_arguments() {
 
 int main() {
     try {
+        // Ordinary causal prefill: A***, AB**, ABC*, ABCD.
+        test_attention(4, 4, 0, 4, 2, 8);
         // Prefill with an offset makes the causal boundary different for each
         // query row and uses a nontrivial GQA group of two.
         test_attention(2, 4, 2, 4, 2, 8);

@@ -28,3 +28,13 @@ Qwen3-0.6B's MLP is SwiGLU rather than a standalone SiLU: after the gate and
 up projections, invoke `launch_swiglu(gate, up, activated, tokens, 3072)`,
 then pass `activated` to the down projection. Run `make softmax-test` and
 `make swiglu-test` for the kernel-specific checks.
+
+For a prompt-to-text demo, activate the local Python environment containing
+`transformers` and run:
+
+```
+python python/chat_infer.py --max-new-tokens 32 "What is the capital of France?"
+```
+
+The helper prints the chat-template input token IDs, runs greedy repeated
+prefill through `build/embedding_gpu`, and decodes the generated token IDs.

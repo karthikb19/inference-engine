@@ -1,6 +1,7 @@
 NVCC ?= nvcc
 CPPFLAGS := -Iinclude
 CUDA_ARCH ?= sm_89
+LDLIBS := -lcublas
 
 TARGET := build/embedding_gpu
 SOURCES := src/main.cpp src/safetensor.cpp src/kernels.cu
@@ -29,35 +30,35 @@ run: $(TARGET)
 
 $(TARGET): $(SOURCES) include/safetensor.hpp include/kernels.cuh include/json.hpp
 	mkdir -p build
-	$(NVCC) -std=c++20 -arch=$(CUDA_ARCH) $(CPPFLAGS) $(SOURCES) -o $@
+	$(NVCC) -std=c++20 -arch=$(CUDA_ARCH) $(CPPFLAGS) $(SOURCES) -o $@ $(LDLIBS)
 
 $(TEST_TARGET): $(TEST_SOURCES) include/kernels.cuh
 	mkdir -p build
-	$(NVCC) -std=c++20 -arch=$(CUDA_ARCH) $(CPPFLAGS) $(TEST_SOURCES) -o $@
+	$(NVCC) -std=c++20 -arch=$(CUDA_ARCH) $(CPPFLAGS) $(TEST_SOURCES) -o $@ $(LDLIBS)
 
 $(RMS_NORM_TEST_TARGET): $(RMS_NORM_TEST_SOURCES) include/kernels.cuh
 	mkdir -p build
-	$(NVCC) -std=c++20 -arch=$(CUDA_ARCH) $(CPPFLAGS) $(RMS_NORM_TEST_SOURCES) -o $@
+	$(NVCC) -std=c++20 -arch=$(CUDA_ARCH) $(CPPFLAGS) $(RMS_NORM_TEST_SOURCES) -o $@ $(LDLIBS)
 
 $(ROPE_TEST_TARGET): $(ROPE_TEST_SOURCES) include/kernels.cuh
 	mkdir -p build
-	$(NVCC) -std=c++20 -arch=$(CUDA_ARCH) $(CPPFLAGS) $(ROPE_TEST_SOURCES) -o $@
+	$(NVCC) -std=c++20 -arch=$(CUDA_ARCH) $(CPPFLAGS) $(ROPE_TEST_SOURCES) -o $@ $(LDLIBS)
 
 $(RESIDUAL_ADD_TEST_TARGET): $(RESIDUAL_ADD_TEST_SOURCES) include/kernels.cuh
 	mkdir -p build
-	$(NVCC) -std=c++20 -arch=$(CUDA_ARCH) $(CPPFLAGS) $(RESIDUAL_ADD_TEST_SOURCES) -o $@
+	$(NVCC) -std=c++20 -arch=$(CUDA_ARCH) $(CPPFLAGS) $(RESIDUAL_ADD_TEST_SOURCES) -o $@ $(LDLIBS)
 
 $(ATTENTION_TEST_TARGET): $(ATTENTION_TEST_SOURCES) include/kernels.cuh
 	mkdir -p build
-	$(NVCC) -std=c++20 -arch=$(CUDA_ARCH) $(CPPFLAGS) $(ATTENTION_TEST_SOURCES) -o $@
+	$(NVCC) -std=c++20 -arch=$(CUDA_ARCH) $(CPPFLAGS) $(ATTENTION_TEST_SOURCES) -o $@ $(LDLIBS)
 
 $(SOFTMAX_TEST_TARGET): $(SOFTMAX_TEST_SOURCES) include/kernels.cuh
 	mkdir -p build
-	$(NVCC) -std=c++20 -arch=$(CUDA_ARCH) $(CPPFLAGS) $(SOFTMAX_TEST_SOURCES) -o $@
+	$(NVCC) -std=c++20 -arch=$(CUDA_ARCH) $(CPPFLAGS) $(SOFTMAX_TEST_SOURCES) -o $@ $(LDLIBS)
 
 $(SWIGLU_TEST_TARGET): $(SWIGLU_TEST_SOURCES) include/kernels.cuh
 	mkdir -p build
-	$(NVCC) -std=c++20 -arch=$(CUDA_ARCH) $(CPPFLAGS) $(SWIGLU_TEST_SOURCES) -o $@
+	$(NVCC) -std=c++20 -arch=$(CUDA_ARCH) $(CPPFLAGS) $(SWIGLU_TEST_SOURCES) -o $@ $(LDLIBS)
 
 test: $(TEST_TARGET) $(RMS_NORM_TEST_TARGET) $(ROPE_TEST_TARGET) $(RESIDUAL_ADD_TEST_TARGET) $(SOFTMAX_TEST_TARGET) $(SWIGLU_TEST_TARGET)
 	./$(TEST_TARGET)

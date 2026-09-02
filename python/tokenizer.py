@@ -2,6 +2,7 @@
 
 Usage:
     python python/tokenizer.py "The capital of France is"
+    python python/tokenizer.py --chat "What is the capital of France?"
     python python/tokenizer.py --decode --ids 791 6864 315 9822 374
 
 The C++ engine exchanges token IDs as space-delimited plain text.
@@ -21,6 +22,11 @@ def main() -> None:
         description="Tokenize and decode text with Qwen3-0.6B."
     )
     parser.add_argument("text", nargs="?", help="Text to tokenize")
+    parser.add_argument(
+        "--chat",
+        action="store_true",
+        help="Wrap text in Qwen's user/assistant chat template with thinking disabled",
+    )
     parser.add_argument("--decode", action="store_true", help="Decode IDs to text")
     parser.add_argument("--ids", nargs="+", type=int, help="Token IDs to decode")
     parser.add_argument("--output", "-o", type=Path, help="Write token IDs to this file")
@@ -40,7 +46,21 @@ def main() -> None:
     if not args.text:
         parser.error("Provide text to tokenize")
 
-    token_ids = tokenizer.encode(args.text)
+    if args.chat:
+        token_ids = tokenizer.apply_chat_template(
+            [{"role": "user", "content": args.text}],
+            tokenize=True,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
+        # Transformers 5 returns a BatchEncoding by default; older releases
+        # returned the token-ID list directly.
+        if not isinstance(token_ids, (list, tuple)):
+            token_ids = token_ids["input_ids"]
+        if token_ids and isinstance(token_ids[0], list):
+            token_ids = token_ids[0]
+    else:
+        token_ids = tokenizer.encode(args.text)
     serialized_ids = " ".join(str(token_id) for token_id in token_ids)
     if args.output:
         args.output.write_text(serialized_ids + "\n", encoding="utf-8")

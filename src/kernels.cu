@@ -1,7 +1,10 @@
 #include "kernels.cuh"
 
+#include <cublas_v2.h>
+
 #include <cmath>
 #include <limits>
+#include <vector>
 
 namespace inference {
 
@@ -243,45 +246,74 @@ cudaError_t launch_rope(const __nv_bfloat16* input,
     return cudaGetLastError();
 }
 
-// Attention implementation exercise.
-//
-// Recommended initial mapping: one CUDA block per (query token, query head),
-// with 128 threads for Qwen3-0.6B. A simple first version can have every
-// thread cooperate on one key at a time and use shared memory for the online
-// softmax state and the output vector. Keep all score/softmax math in FP32.
-// The contract and edge cases are encoded in tests/attention_test.cu.
-__global__ void causal_attention_kernel(const __nv_bfloat16* query,
-                                        const __nv_bfloat16* key_cache,
-                                        const __nv_bfloat16* value_cache,
-                                        __nv_bfloat16* output,
-                                        std::int32_t query_tokens,
-                                        std::int32_t key_value_tokens,
-                                        std::int32_t query_start_position,
-                                        std::int32_t query_heads,
-                                        std::int32_t key_value_heads,
-                                        std::int32_t head_dim,
-                                        float attention_scale) {
-    // TODO: Implement causal GQA attention.
-    // Grid:  dim3(query_heads, query_tokens)
-    // Block: dim3(head_dim) for Qwen3-0.6B (128 threads)
-    //
-    // query_head = blockIdx.x; query_token = blockIdx.y;
-    // kv_head = query_head / (query_heads / key_value_heads);
-    // last_key = query_start_position + query_token;
-    //
-    // Do not write a partial implementation: this inert body intentionally
-    // makes attention_test fail until all dimensions are produced correctly.
-    (void)query;
-    (void)key_cache;
-    (void)value_cache;
-    (void)output;
-    (void)query_tokens;
-    (void)key_value_tokens;
-    (void)query_start_position;
-    (void)query_heads;
-    (void)key_value_heads;
-    (void)head_dim;
-    (void)attention_scale;
+// scores has layout [query_heads, query_tokens, key_value_tokens]. One block
+// owns one row scores[query_head, query_token, :]. Thread k changes columns
+// k, k + blockDim.x, ... so all future-token logits become -infinity before
+// the existing row-softmax kernel turns them into zero probabilities.
+__global__ void causal_mask_kernel(float* scores,
+                                   std::int32_t query_tokens,
+                                   std::int32_t key_value_tokens,
+                                   std::int32_t query_start_position) {
+    const std::int32_t query_head = blockIdx.x;
+    const std::int32_t query_token = blockIdx.y;
+    const std::int32_t last_allowed_key = query_start_position + query_token;
+    const std::int64_t row_base =
+        (static_cast<std::int64_t>(query_head) * query_tokens + query_token) * key_value_tokens;
+
+    for (std::int32_t key_token = threadIdx.x; key_token < key_value_tokens;
+         key_token += blockDim.x) {
+        if (key_token > last_allowed_key) scores[row_base + key_token] = -INFINITY;
+    }
+}
+
+__global__ void bf16_to_float_kernel(const __nv_bfloat16* input, float* output,
+                                     std::int64_t element_count) {
+    const std::int64_t index = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index < element_count) output[index] = __bfloat162float(input[index]);
+}
+
+__global__ void float_to_bf16_kernel(const float* input, __nv_bfloat16* output,
+                                     std::int64_t element_count) {
+    const std::int64_t index = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index < element_count) output[index] = __float2bfloat16(input[index]);
+}
+
+class DeviceAllocation {
+public:
+    DeviceAllocation() = default;
+    ~DeviceAllocation() { if (pointer_ != nullptr) cudaFree(pointer_); }
+    DeviceAllocation(const DeviceAllocation&) = delete;
+
+    cudaError_t allocate(std::size_t bytes) { return cudaMalloc(&pointer_, bytes); }
+    [[nodiscard]] void* get() const { return pointer_; }
+
+private:
+    void* pointer_ = nullptr;
+};
+
+class CublasHandle {
+public:
+    ~CublasHandle() { if (handle_ != nullptr) cublasDestroy(handle_); }
+    CublasHandle(const CublasHandle&) = delete;
+    CublasHandle() = default;
+
+    cublasStatus_t create() { return cublasCreate(&handle_); }
+    [[nodiscard]] cublasHandle_t get() const { return handle_; }
+
+private:
+    cublasHandle_t handle_ = nullptr;
+};
+
+cudaError_t cublas_error(cublasStatus_t status) {
+    switch (status) {
+        case CUBLAS_STATUS_SUCCESS: return cudaSuccess;
+        case CUBLAS_STATUS_ALLOC_FAILED: return cudaErrorMemoryAllocation;
+        case CUBLAS_STATUS_INVALID_VALUE: return cudaErrorInvalidValue;
+        case CUBLAS_STATUS_ARCH_MISMATCH:
+        case CUBLAS_STATUS_NOT_SUPPORTED: return cudaErrorNotSupported;
+        case CUBLAS_STATUS_EXECUTION_FAILED: return cudaErrorLaunchFailure;
+        default: return cudaErrorUnknown;
+    }
 }
 
 cudaError_t launch_causal_attention(const __nv_bfloat16* query,
@@ -305,13 +337,136 @@ cudaError_t launch_causal_attention(const __nv_bfloat16* query,
         return cudaErrorInvalidValue;
     }
 
-    // This is intentionally the launch geometry your kernel should target.
-    // For Qwen3-0.6B: grid=(16, query_tokens), block=(128).
-    const dim3 grid(query_heads, query_tokens);
-    const dim3 block(head_dim);
-    causal_attention_kernel<<<grid, block, 0, stream>>>(
-        query, key_cache, value_cache, output, query_tokens, key_value_tokens,
-        query_start_position, query_heads, key_value_heads, head_dim, attention_scale);
+    // Stage 1: cuBLAS computes Q @ K^T for each query head into FP32 scores.
+    // Stage 2: causal_mask_kernel and launch_softmax transform scores into P.
+    // Stage 3: cuBLAS computes P @ V for each query head.
+    const std::size_t score_count = static_cast<std::size_t>(query_heads) * query_tokens * key_value_tokens;
+    if (score_count > std::numeric_limits<std::size_t>::max() / sizeof(float)) {
+        return cudaErrorInvalidValue;
+    }
+
+    DeviceAllocation score_storage;
+    cudaError_t status = score_storage.allocate(score_count * sizeof(float));
+    if (status != cudaSuccess) return status;
+    auto* scores = static_cast<float*>(score_storage.get());
+
+    const std::size_t value_count = static_cast<std::size_t>(key_value_tokens) * key_value_heads * head_dim;
+    const std::size_t output_count = static_cast<std::size_t>(query_tokens) * query_heads * head_dim;
+    if (value_count > std::numeric_limits<std::size_t>::max() / sizeof(float) ||
+        output_count > std::numeric_limits<std::size_t>::max() / sizeof(float)) {
+        return cudaErrorInvalidValue;
+    }
+    // GemmBatchedEx requires its two input matrices to have the same type.
+    // Keep P and the P@V accumulation in FP32 by converting V once here,
+    // then round only the final attention output back to BF16.
+    DeviceAllocation values_fp32_storage;
+    DeviceAllocation output_fp32_storage;
+    if ((status = values_fp32_storage.allocate(value_count * sizeof(float))) != cudaSuccess ||
+        (status = output_fp32_storage.allocate(output_count * sizeof(float))) != cudaSuccess) {
+        return status;
+    }
+    auto* values_fp32 = static_cast<float*>(values_fp32_storage.get());
+    auto* output_fp32 = static_cast<float*>(output_fp32_storage.get());
+    constexpr std::int32_t conversion_threads = 256;
+    const std::int64_t conversion_blocks =
+        (static_cast<std::int64_t>(value_count) + conversion_threads - 1) / conversion_threads;
+    bf16_to_float_kernel<<<static_cast<unsigned int>(conversion_blocks), conversion_threads, 0, stream>>>(
+        value_cache, values_fp32, value_count);
+    if ((status = cudaGetLastError()) != cudaSuccess) return status;
+
+    // GQA repeats each KV-head pointer for its query-head group. Pointer-array
+    // batched GEMM expresses that repetition without copying K or V.
+    std::vector<const __nv_bfloat16*> query_pointers(query_heads);
+    std::vector<const __nv_bfloat16*> key_pointers(query_heads);
+    std::vector<float*> value_pointers(query_heads);
+    std::vector<float*> score_pointers(query_heads);
+    std::vector<float*> output_pointers(query_heads);
+    const std::int32_t group_size = query_heads / key_value_heads;
+    for (std::int32_t query_head = 0; query_head < query_heads; ++query_head) {
+        const std::int32_t kv_head = query_head / group_size;
+        query_pointers[query_head] = query + static_cast<std::int64_t>(query_head) * head_dim;
+        key_pointers[query_head] = key_cache + static_cast<std::int64_t>(kv_head) * head_dim;
+        value_pointers[query_head] = values_fp32 + static_cast<std::int64_t>(kv_head) * head_dim;
+        score_pointers[query_head] = scores + static_cast<std::int64_t>(query_head) * query_tokens * key_value_tokens;
+        output_pointers[query_head] = output_fp32 + static_cast<std::int64_t>(query_head) * head_dim;
+    }
+
+    DeviceAllocation query_pointer_storage;
+    DeviceAllocation key_pointer_storage;
+    DeviceAllocation value_pointer_storage;
+    DeviceAllocation score_pointer_storage;
+    DeviceAllocation output_pointer_storage;
+    const std::size_t pointer_bytes = static_cast<std::size_t>(query_heads) * sizeof(void*);
+    if ((status = query_pointer_storage.allocate(pointer_bytes)) != cudaSuccess ||
+        (status = key_pointer_storage.allocate(pointer_bytes)) != cudaSuccess ||
+        (status = value_pointer_storage.allocate(pointer_bytes)) != cudaSuccess ||
+        (status = score_pointer_storage.allocate(pointer_bytes)) != cudaSuccess ||
+        (status = output_pointer_storage.allocate(pointer_bytes)) != cudaSuccess) {
+        return status;
+    }
+    if ((status = cudaMemcpyAsync(query_pointer_storage.get(), query_pointers.data(), pointer_bytes,
+                                  cudaMemcpyHostToDevice, stream)) != cudaSuccess ||
+        (status = cudaMemcpyAsync(key_pointer_storage.get(), key_pointers.data(), pointer_bytes,
+                                  cudaMemcpyHostToDevice, stream)) != cudaSuccess ||
+        (status = cudaMemcpyAsync(value_pointer_storage.get(), value_pointers.data(), pointer_bytes,
+                                  cudaMemcpyHostToDevice, stream)) != cudaSuccess ||
+        (status = cudaMemcpyAsync(score_pointer_storage.get(), score_pointers.data(), pointer_bytes,
+                                  cudaMemcpyHostToDevice, stream)) != cudaSuccess ||
+        (status = cudaMemcpyAsync(output_pointer_storage.get(), output_pointers.data(), pointer_bytes,
+                                  cudaMemcpyHostToDevice, stream)) != cudaSuccess) {
+        return status;
+    }
+
+    CublasHandle handle;
+    if ((status = cublas_error(handle.create())) != cudaSuccess ||
+        (status = cublas_error(cublasSetStream(handle.get(), stream))) != cudaSuccess) {
+        return status;
+    }
+
+    const float zero = 0.0F;
+
+    // Row-major Q[Tq, Dh] is column-major Q^T[Dh, Tq], and likewise for K.
+    // Therefore K^T (column-major) times Q^T produces score storage laid out
+    // as row-major [Tq, Tk]. GEMM batches over query heads.
+    if ((status = cublas_error(cublasGemmBatchedEx(
+            handle.get(), CUBLAS_OP_T, CUBLAS_OP_N,
+            key_value_tokens, query_tokens, head_dim,
+            &attention_scale,
+            reinterpret_cast<const void* const*>(key_pointer_storage.get()), CUDA_R_16BF, key_value_heads * head_dim,
+            reinterpret_cast<const void* const*>(query_pointer_storage.get()), CUDA_R_16BF, query_heads * head_dim,
+            &zero,
+            reinterpret_cast<void* const*>(score_pointer_storage.get()), CUDA_R_32F, key_value_tokens,
+            query_heads, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT))) != cudaSuccess) {
+        return status;
+    }
+
+    constexpr std::int32_t mask_threads = 256;
+    causal_mask_kernel<<<dim3(query_heads, query_tokens), mask_threads, 0, stream>>>(
+        scores, query_tokens, key_value_tokens, query_start_position);
+    if ((status = cudaGetLastError()) != cudaSuccess) return status;
+    if ((status = launch_softmax(scores, scores, query_heads * query_tokens,
+                                 key_value_tokens, stream)) != cudaSuccess) {
+        return status;
+    }
+
+    const float one = 1.0F;
+    // In the same column-major view, V[ Tk, Dh ] becomes [Dh, Tk] and P is
+    // [Tk, Tq], so V * P writes the row-major output [Tq, Dh].
+    if ((status = cublas_error(cublasSgemmBatched(
+            handle.get(), CUBLAS_OP_N, CUBLAS_OP_N,
+            head_dim, query_tokens, key_value_tokens,
+            &one,
+            reinterpret_cast<const float* const*>(value_pointer_storage.get()), key_value_heads * head_dim,
+            reinterpret_cast<const float* const*>(score_pointer_storage.get()), key_value_tokens,
+            &zero,
+            reinterpret_cast<float* const*>(output_pointer_storage.get()), query_heads * head_dim,
+            query_heads))) != cudaSuccess) {
+        return status;
+    }
+    const std::int64_t output_blocks =
+        (static_cast<std::int64_t>(output_count) + conversion_threads - 1) / conversion_threads;
+    float_to_bf16_kernel<<<static_cast<unsigned int>(output_blocks), conversion_threads, 0, stream>>>(
+        output_fp32, output, output_count);
     return cudaGetLastError();
 }
 
