@@ -7,6 +7,27 @@
 
 namespace inference {
 
+// Qwen3-0.6B attention geometry, copied from models/Qwen3-0.6B/config.json.
+// It uses grouped-query attention (GQA), not multi-query attention: each of
+// the 8 KV heads is shared by 2 of the 16 query heads.
+struct AttentionConfig {
+    std::int32_t query_heads;
+    std::int32_t key_value_heads;
+    std::int32_t head_dim;
+    float rope_theta;
+};
+
+inline constexpr AttentionConfig qwen3_0_6b_attention{
+    .query_heads = 16,
+    .key_value_heads = 8,
+    .head_dim = 128,
+    .rope_theta = 1'000'000.0F,
+};
+
+inline constexpr std::int32_t qwen3_0_6b_gqa_group_size =
+    qwen3_0_6b_attention.query_heads / qwen3_0_6b_attention.key_value_heads;
+inline constexpr float qwen3_0_6b_attention_scale = 0.08838834764831843F;  // 1 / sqrt(128)
+
 // Device-memory contract for Qwen's token embedding lookup:
 //
 //   embedding_table: [vocab_size, hidden_size] __nv_bfloat16 values
@@ -61,6 +82,37 @@ cudaError_t launch_rope(const __nv_bfloat16* input,
                         std::int32_t num_heads,
                         std::int32_t head_dim,
                         cudaStream_t stream = nullptr);
+
+// Causal scaled dot-product attention with grouped-query attention (GQA).
+//
+//   query:       [query_tokens, query_heads, head_dim] BF16
+//   key_cache:   [key_value_tokens, key_value_heads, head_dim] BF16
+//   value_cache: [key_value_tokens, key_value_heads, head_dim] BF16
+//   output:      [query_tokens, query_heads, head_dim] BF16
+//
+// key_cache and value_cache contain positions [0, key_value_tokens). The
+// first query token corresponds to absolute position query_start_position;
+// query token q can attend only to keys <= query_start_position + q. This
+// covers both prefill (query_start_position == 0) and decode (normally
+// query_tokens == 1 and query_start_position == key_value_tokens - 1).
+//
+// GQA head mapping is kv_head = query_head / (query_heads / key_value_heads).
+// Scores, softmax, and accumulation must be FP32; round only final output to
+// BF16. query/key/value/output must point to device memory and output must not
+// overlap an input. attention_scale is normally 1 / sqrt(head_dim), i.e.
+// qwen3_0_6b_attention_scale for this model.
+cudaError_t launch_causal_attention(const __nv_bfloat16* query,
+                                    const __nv_bfloat16* key_cache,
+                                    const __nv_bfloat16* value_cache,
+                                    __nv_bfloat16* output,
+                                    std::int32_t query_tokens,
+                                    std::int32_t key_value_tokens,
+                                    std::int32_t query_start_position,
+                                    std::int32_t query_heads,
+                                    std::int32_t key_value_heads,
+                                    std::int32_t head_dim,
+                                    float attention_scale,
+                                    cudaStream_t stream = nullptr);
 
 // In-place residual connection:
 //   input    <- input + residual

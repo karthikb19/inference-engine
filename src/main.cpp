@@ -18,13 +18,6 @@ namespace {
 constexpr char first_attention_norm_name[] = "model.layers.0.input_layernorm.weight";
 constexpr float rms_norm_epsilon = 1.0e-6F;
 
-// Qwen3-0.6B configuration. These will be used when the Q/K projections and
-// RoPE frequency tables are added to the first transformer-block dispatch.
-constexpr std::int32_t qwen_head_dim = 128;
-constexpr std::int32_t qwen_attention_heads = 16;
-constexpr std::int32_t qwen_key_value_heads = 8;
-constexpr float qwen_rope_theta = 1'000'000.0F;
-
 // CUDA helpers
 void cuda_check(cudaError_t status, std::string_view operation) {
     if (status != cudaSuccess) {
@@ -186,18 +179,20 @@ int main(int argc, char** argv) {
 
         // Next transformer-block milestone (after the Q/K linear projections):
         //
-        //   DeviceBuffer<__nv_bfloat16> device_query(tokens * qwen_attention_heads * qwen_head_dim);
-        //   DeviceBuffer<__nv_bfloat16> device_key(tokens * qwen_key_value_heads * qwen_head_dim);
+        //   DeviceBuffer<__nv_bfloat16> device_query(tokens * inference::qwen3_0_6b_attention.query_heads * inference::qwen3_0_6b_attention.head_dim);
+        //   DeviceBuffer<__nv_bfloat16> device_key(tokens * inference::qwen3_0_6b_attention.key_value_heads * inference::qwen3_0_6b_attention.head_dim);
         //   DeviceBuffer<std::int32_t> device_positions(tokens);
-        //   DeviceBuffer<float> device_rope_cos(max_positions * (qwen_head_dim / 2));
-        //   DeviceBuffer<float> device_rope_sin(max_positions * (qwen_head_dim / 2));
+        //   DeviceBuffer<float> device_rope_cos(max_positions * (inference::qwen3_0_6b_attention.head_dim / 2));
+        //   DeviceBuffer<float> device_rope_sin(max_positions * (inference::qwen3_0_6b_attention.head_dim / 2));
         //
         //   launch_rope(device_query.get(), device_positions.get(), device_rope_cos.get(),
         //               device_rope_sin.get(), device_query.get(), tokens,
-        //               qwen_attention_heads, qwen_head_dim);
+        //               inference::qwen3_0_6b_attention.query_heads,
+        //               inference::qwen3_0_6b_attention.head_dim);
         //
-        // Apply the same operation to device_key with qwen_key_value_heads.
-        // Build the shared cos/sin tables once from qwen_rope_theta; position
+        // Apply the same operation to device_key with
+        // inference::qwen3_0_6b_attention.key_value_heads. Build the shared
+        // cos/sin tables once from inference::qwen3_0_6b_attention.rope_theta; position
         // IDs must account for the number of tokens already in the KV cache.
         // After attention's output projection, preserve device_output as the
         // residual stream and add the projection in place:

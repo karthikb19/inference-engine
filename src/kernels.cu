@@ -1,5 +1,6 @@
 #include "kernels.cuh"
 
+#include <cmath>
 #include <limits>
 
 namespace inference {
@@ -157,6 +158,78 @@ cudaError_t launch_rope(const __nv_bfloat16* input,
     const dim3 block(threads_per_block);
     rope_kernel<<<grid, block, 0, stream>>>(input, position_ids, cos, sin, output,
                                               num_tokens, num_heads, head_dim);
+    return cudaGetLastError();
+}
+
+// Attention implementation exercise.
+//
+// Recommended initial mapping: one CUDA block per (query token, query head),
+// with 128 threads for Qwen3-0.6B. A simple first version can have every
+// thread cooperate on one key at a time and use shared memory for the online
+// softmax state and the output vector. Keep all score/softmax math in FP32.
+// The contract and edge cases are encoded in tests/attention_test.cu.
+__global__ void causal_attention_kernel(const __nv_bfloat16* query,
+                                        const __nv_bfloat16* key_cache,
+                                        const __nv_bfloat16* value_cache,
+                                        __nv_bfloat16* output,
+                                        std::int32_t query_tokens,
+                                        std::int32_t key_value_tokens,
+                                        std::int32_t query_start_position,
+                                        std::int32_t query_heads,
+                                        std::int32_t key_value_heads,
+                                        std::int32_t head_dim,
+                                        float attention_scale) {
+    // TODO: Implement causal GQA attention.
+    // Grid:  dim3(query_heads, query_tokens)
+    // Block: dim3(head_dim) for Qwen3-0.6B (128 threads)
+    //
+    // query_head = blockIdx.x; query_token = blockIdx.y;
+    // kv_head = query_head / (query_heads / key_value_heads);
+    // last_key = query_start_position + query_token;
+    //
+    // Do not write a partial implementation: this inert body intentionally
+    // makes attention_test fail until all dimensions are produced correctly.
+    (void)query;
+    (void)key_cache;
+    (void)value_cache;
+    (void)output;
+    (void)query_tokens;
+    (void)key_value_tokens;
+    (void)query_start_position;
+    (void)query_heads;
+    (void)key_value_heads;
+    (void)head_dim;
+    (void)attention_scale;
+}
+
+cudaError_t launch_causal_attention(const __nv_bfloat16* query,
+                                    const __nv_bfloat16* key_cache,
+                                    const __nv_bfloat16* value_cache,
+                                    __nv_bfloat16* output,
+                                    std::int32_t query_tokens,
+                                    std::int32_t key_value_tokens,
+                                    std::int32_t query_start_position,
+                                    std::int32_t query_heads,
+                                    std::int32_t key_value_heads,
+                                    std::int32_t head_dim,
+                                    float attention_scale,
+                                    cudaStream_t stream) {
+    if (query == nullptr || key_cache == nullptr || value_cache == nullptr || output == nullptr ||
+        query_tokens <= 0 || key_value_tokens <= 0 || query_start_position < 0 ||
+        query_heads <= 0 || key_value_heads <= 0 || head_dim <= 0 || head_dim > 1024 ||
+        query_heads % key_value_heads != 0 ||
+        query_start_position > key_value_tokens - query_tokens ||
+        !std::isfinite(attention_scale) || attention_scale <= 0.0F) {
+        return cudaErrorInvalidValue;
+    }
+
+    // This is intentionally the launch geometry your kernel should target.
+    // For Qwen3-0.6B: grid=(16, query_tokens), block=(128).
+    const dim3 grid(query_heads, query_tokens);
+    const dim3 block(head_dim);
+    causal_attention_kernel<<<grid, block, 0, stream>>>(
+        query, key_cache, value_cache, output, query_tokens, key_value_tokens,
+        query_start_position, query_heads, key_value_heads, head_dim, attention_scale);
     return cudaGetLastError();
 }
 

@@ -12,6 +12,8 @@ ROPE_TEST_TARGET := build/rope_test
 ROPE_TEST_SOURCES := tests/rope_test.cu src/kernels.cu
 RESIDUAL_ADD_TEST_TARGET := build/residual_add_test
 RESIDUAL_ADD_TEST_SOURCES := tests/residual_add_test.cu src/kernels.cu
+ATTENTION_TEST_TARGET := build/attention_test
+ATTENTION_TEST_SOURCES := tests/attention_test.cu src/kernels.cu
 TOKENS ?= 791
 
 .PHONY: all run test clean
@@ -41,6 +43,10 @@ $(RESIDUAL_ADD_TEST_TARGET): $(RESIDUAL_ADD_TEST_SOURCES) include/kernels.cuh
 	mkdir -p build
 	$(NVCC) -std=c++20 -arch=$(CUDA_ARCH) $(CPPFLAGS) $(RESIDUAL_ADD_TEST_SOURCES) -o $@
 
+$(ATTENTION_TEST_TARGET): $(ATTENTION_TEST_SOURCES) include/kernels.cuh
+	mkdir -p build
+	$(NVCC) -std=c++20 -arch=$(CUDA_ARCH) $(CPPFLAGS) $(ATTENTION_TEST_SOURCES) -o $@
+
 test: $(TEST_TARGET) $(RMS_NORM_TEST_TARGET) $(ROPE_TEST_TARGET) $(RESIDUAL_ADD_TEST_TARGET)
 	./$(TEST_TARGET)
 	./$(RMS_NORM_TEST_TARGET)
@@ -58,6 +64,11 @@ rope-test: $(ROPE_TEST_TARGET)
 .PHONY: residual-add-test
 residual-add-test: $(RESIDUAL_ADD_TEST_TARGET)
 	./$(RESIDUAL_ADD_TEST_TARGET)
+
+# This is intentionally opt-in until causal_attention_kernel is implemented.
+.PHONY: attention-test
+attention-test: $(ATTENTION_TEST_TARGET)
+	./$(ATTENTION_TEST_TARGET)
 
 clean:
 	rm -rf build
