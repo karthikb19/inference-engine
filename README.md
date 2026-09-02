@@ -38,4 +38,6 @@ python python/chat_infer.py --max-new-tokens 32 "What is the capital of France?"
 
 The helper prints the chat-template input token IDs, runs one prompt prefill,
 then performs greedy one-token decoding with a persistent per-layer GPU KV
-cache. It finally decodes the generated token IDs back to text.
+cache. Model weights are uploaded to GPU memory once before inference and stay
+resident across both phases. The helper finally decodes the generated token
+IDs back to text.

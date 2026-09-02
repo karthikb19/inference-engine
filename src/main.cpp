@@ -64,6 +64,23 @@ private:
     T* data_ = nullptr;
 };
 
+// Owns all device-resident parameters for one transformer block. DeviceBuffer
+// itself only stores a CUDA pointer; moving LayerWeights transfers ownership
+// of those pointers without copying any tensor data.
+struct LayerWeights {
+    DeviceBuffer<__nv_bfloat16> input_norm;
+    DeviceBuffer<__nv_bfloat16> q_proj;
+    DeviceBuffer<__nv_bfloat16> k_proj;
+    DeviceBuffer<__nv_bfloat16> v_proj;
+    DeviceBuffer<__nv_bfloat16> o_proj;
+    DeviceBuffer<__nv_bfloat16> q_norm;
+    DeviceBuffer<__nv_bfloat16> k_norm;
+    DeviceBuffer<__nv_bfloat16> post_attention_norm;
+    DeviceBuffer<__nv_bfloat16> gate_proj;
+    DeviceBuffer<__nv_bfloat16> up_proj;
+    DeviceBuffer<__nv_bfloat16> down_proj;
+};
+
 void print_shape(const std::vector<std::uint64_t>& shape) {
     std::cout << '[';
     for (std::size_t i = 0; i < shape.size(); ++i) {
@@ -249,7 +266,6 @@ int main(int argc, char** argv) {
             value_caches.emplace_back(cache_values);
         }
 
-        const auto weights = model.read_tensor(embedding_name);
         std::vector<std::int32_t> host_token_ids;
         host_token_ids.reserve(token_ids.size());
         for (const auto token_id : token_ids) {
@@ -273,15 +289,57 @@ int main(int argc, char** argv) {
             return device_weight;
         };
 
+        const auto device_embedding =
+            upload_bf16(embedding_name, {vocab_size, hidden_size});
+
+        // Keep every transformer parameter resident for the whole request.
+        // Loading happens once here, before either prefill or token decoding.
+        std::vector<LayerWeights> layer_weights;
+        layer_weights.reserve(qwen_layer_count);
+        for (std::int32_t layer = 0; layer < qwen_layer_count; ++layer) {
+            layer_weights.push_back(LayerWeights{
+                .input_norm = upload_bf16(
+                    layer_tensor_name(layer, "input_layernorm.weight"), {hidden_size}),
+                .q_proj = upload_bf16(
+                    layer_tensor_name(layer, "self_attn.q_proj.weight"),
+                    {attention.query_heads * attention.head_dim, hidden_size}),
+                .k_proj = upload_bf16(
+                    layer_tensor_name(layer, "self_attn.k_proj.weight"),
+                    {attention.key_value_heads * attention.head_dim, hidden_size}),
+                .v_proj = upload_bf16(
+                    layer_tensor_name(layer, "self_attn.v_proj.weight"),
+                    {attention.key_value_heads * attention.head_dim, hidden_size}),
+                .o_proj = upload_bf16(
+                    layer_tensor_name(layer, "self_attn.o_proj.weight"),
+                    {hidden_size, attention.query_heads * attention.head_dim}),
+                .q_norm = upload_bf16(
+                    layer_tensor_name(layer, "self_attn.q_norm.weight"),
+                    {attention.head_dim}),
+                .k_norm = upload_bf16(
+                    layer_tensor_name(layer, "self_attn.k_norm.weight"),
+                    {attention.head_dim}),
+                .post_attention_norm = upload_bf16(
+                    layer_tensor_name(layer, "post_attention_layernorm.weight"),
+                    {hidden_size}),
+                .gate_proj = upload_bf16(
+                    layer_tensor_name(layer, "mlp.gate_proj.weight"),
+                    {inference::qwen3_0_6b_mlp_intermediate_size, hidden_size}),
+                .up_proj = upload_bf16(
+                    layer_tensor_name(layer, "mlp.up_proj.weight"),
+                    {inference::qwen3_0_6b_mlp_intermediate_size, hidden_size}),
+                .down_proj = upload_bf16(
+                    layer_tensor_name(layer, "mlp.down_proj.weight"),
+                    {hidden_size, inference::qwen3_0_6b_mlp_intermediate_size}),
+            });
+        }
+
         // Reusable device buffers are sized for prefill, the largest query pass.
-        const auto embedding_values = embedding.byte_size() / sizeof(__nv_bfloat16);
         const auto maximum_query_tokens = static_cast<std::int32_t>(prompt_tokens);
         const auto output_values = prompt_tokens * static_cast<std::size_t>(hidden_size);
         const std::size_t query_values = prompt_tokens * attention.query_heads * attention.head_dim;
         const std::size_t new_key_value_values = prompt_tokens * kv_values_per_token;
         const std::size_t intermediate_values =
             prompt_tokens * inference::qwen3_0_6b_mlp_intermediate_size;
-        DeviceBuffer<__nv_bfloat16> device_embedding(embedding_values);
         DeviceBuffer<std::int32_t> device_token_ids(prompt_tokens);
         DeviceBuffer<__nv_bfloat16> device_hidden(output_values);
         DeviceBuffer<__nv_bfloat16> device_normed(output_values);
@@ -294,8 +352,6 @@ int main(int argc, char** argv) {
         DeviceBuffer<__nv_bfloat16> device_up(intermediate_values);
         DeviceBuffer<__nv_bfloat16> device_activated(intermediate_values);
         DeviceBuffer<__nv_bfloat16> device_logits(vocab_size);
-        cuda_check(cudaMemcpy(device_embedding.get(), weights.data(), weights.size(), cudaMemcpyHostToDevice),
-                   "cudaMemcpy embedding table H2D");
 
         std::vector<float> rope_cos(maximum_cached_tokens * (attention.head_dim / 2));
         std::vector<float> rope_sin(rope_cos.size());
@@ -355,20 +411,14 @@ int main(int argc, char** argv) {
                    "launch_embedding_gather");
 
         for (std::int32_t layer = 0; layer < qwen_layer_count; ++layer) {
-            const auto input_norm = upload_bf16(layer_tensor_name(layer, "input_layernorm.weight"), {hidden_size});
-            const auto q_weight = upload_bf16(layer_tensor_name(layer, "self_attn.q_proj.weight"), {attention.query_heads * attention.head_dim, hidden_size});
-            const auto k_weight = upload_bf16(layer_tensor_name(layer, "self_attn.k_proj.weight"), {attention.key_value_heads * attention.head_dim, hidden_size});
-            const auto v_weight = upload_bf16(layer_tensor_name(layer, "self_attn.v_proj.weight"), {attention.key_value_heads * attention.head_dim, hidden_size});
-            const auto o_weight = upload_bf16(layer_tensor_name(layer, "self_attn.o_proj.weight"), {hidden_size, attention.query_heads * attention.head_dim});
-            const auto q_norm = upload_bf16(layer_tensor_name(layer, "self_attn.q_norm.weight"), {attention.head_dim});
-            const auto k_norm = upload_bf16(layer_tensor_name(layer, "self_attn.k_norm.weight"), {attention.head_dim});
+            const auto& layer_weight = layer_weights[layer];
 
-            cuda_check(inference::launch_rms_norm(device_hidden.get(), input_norm.get(), device_normed.get(), query_tokens, hidden_size, rms_norm_epsilon), "attention RMSNorm");
-            linear_bf16(cublas.get(), device_normed.get(), q_weight.get(), device_query.get(), query_tokens, hidden_size, attention.query_heads * attention.head_dim);
-            linear_bf16(cublas.get(), device_normed.get(), k_weight.get(), device_key.get(), query_tokens, hidden_size, attention.key_value_heads * attention.head_dim);
-            linear_bf16(cublas.get(), device_normed.get(), v_weight.get(), device_value.get(), query_tokens, hidden_size, attention.key_value_heads * attention.head_dim);
-            cuda_check(inference::launch_rms_norm(device_query.get(), q_norm.get(), device_query.get(), query_tokens * attention.query_heads, attention.head_dim, rms_norm_epsilon), "Q RMSNorm");
-            cuda_check(inference::launch_rms_norm(device_key.get(), k_norm.get(), device_key.get(), query_tokens * attention.key_value_heads, attention.head_dim, rms_norm_epsilon), "K RMSNorm");
+            cuda_check(inference::launch_rms_norm(device_hidden.get(), layer_weight.input_norm.get(), device_normed.get(), query_tokens, hidden_size, rms_norm_epsilon), "attention RMSNorm");
+            linear_bf16(cublas.get(), device_normed.get(), layer_weight.q_proj.get(), device_query.get(), query_tokens, hidden_size, attention.query_heads * attention.head_dim);
+            linear_bf16(cublas.get(), device_normed.get(), layer_weight.k_proj.get(), device_key.get(), query_tokens, hidden_size, attention.key_value_heads * attention.head_dim);
+            linear_bf16(cublas.get(), device_normed.get(), layer_weight.v_proj.get(), device_value.get(), query_tokens, hidden_size, attention.key_value_heads * attention.head_dim);
+            cuda_check(inference::launch_rms_norm(device_query.get(), layer_weight.q_norm.get(), device_query.get(), query_tokens * attention.query_heads, attention.head_dim, rms_norm_epsilon), "Q RMSNorm");
+            cuda_check(inference::launch_rms_norm(device_key.get(), layer_weight.k_norm.get(), device_key.get(), query_tokens * attention.key_value_heads, attention.head_dim, rms_norm_epsilon), "K RMSNorm");
             cuda_check(inference::launch_rope(device_query.get(), device_positions.get(), device_rope_cos.get(), device_rope_sin.get(), device_query.get(), query_tokens, attention.query_heads, attention.head_dim), "Q RoPE");
             cuda_check(inference::launch_rope(device_key.get(), device_positions.get(), device_rope_cos.get(), device_rope_sin.get(), device_key.get(), query_tokens, attention.key_value_heads, attention.head_dim), "K RoPE");
 
@@ -382,18 +432,14 @@ int main(int argc, char** argv) {
                                        append_bytes, cudaMemcpyDeviceToDevice),
                        "append value cache");
             cuda_check(inference::launch_causal_attention(device_query.get(), key_caches[layer].get(), value_caches[layer].get(), device_attention.get(), query_tokens, key_value_tokens, query_start_position, attention.query_heads, attention.key_value_heads, attention.head_dim, inference::qwen3_0_6b_attention_scale), "causal attention");
-            linear_bf16(cublas.get(), device_attention.get(), o_weight.get(), device_projection.get(), query_tokens, attention.query_heads * attention.head_dim, hidden_size);
+            linear_bf16(cublas.get(), device_attention.get(), layer_weight.o_proj.get(), device_projection.get(), query_tokens, attention.query_heads * attention.head_dim, hidden_size);
             cuda_check(inference::launch_residual_add(device_hidden.get(), device_projection.get(), query_tokens, hidden_size), "attention residual");
 
-            const auto post_norm = upload_bf16(layer_tensor_name(layer, "post_attention_layernorm.weight"), {hidden_size});
-            const auto gate_weight = upload_bf16(layer_tensor_name(layer, "mlp.gate_proj.weight"), {inference::qwen3_0_6b_mlp_intermediate_size, hidden_size});
-            const auto up_weight = upload_bf16(layer_tensor_name(layer, "mlp.up_proj.weight"), {inference::qwen3_0_6b_mlp_intermediate_size, hidden_size});
-            const auto down_weight = upload_bf16(layer_tensor_name(layer, "mlp.down_proj.weight"), {hidden_size, inference::qwen3_0_6b_mlp_intermediate_size});
-            cuda_check(inference::launch_rms_norm(device_hidden.get(), post_norm.get(), device_normed.get(), query_tokens, hidden_size, rms_norm_epsilon), "MLP RMSNorm");
-            linear_bf16(cublas.get(), device_normed.get(), gate_weight.get(), device_gate.get(), query_tokens, hidden_size, inference::qwen3_0_6b_mlp_intermediate_size);
-            linear_bf16(cublas.get(), device_normed.get(), up_weight.get(), device_up.get(), query_tokens, hidden_size, inference::qwen3_0_6b_mlp_intermediate_size);
+            cuda_check(inference::launch_rms_norm(device_hidden.get(), layer_weight.post_attention_norm.get(), device_normed.get(), query_tokens, hidden_size, rms_norm_epsilon), "MLP RMSNorm");
+            linear_bf16(cublas.get(), device_normed.get(), layer_weight.gate_proj.get(), device_gate.get(), query_tokens, hidden_size, inference::qwen3_0_6b_mlp_intermediate_size);
+            linear_bf16(cublas.get(), device_normed.get(), layer_weight.up_proj.get(), device_up.get(), query_tokens, hidden_size, inference::qwen3_0_6b_mlp_intermediate_size);
             cuda_check(inference::launch_swiglu(device_gate.get(), device_up.get(), device_activated.get(), query_tokens, inference::qwen3_0_6b_mlp_intermediate_size), "SwiGLU");
-            linear_bf16(cublas.get(), device_activated.get(), down_weight.get(), device_projection.get(), query_tokens, inference::qwen3_0_6b_mlp_intermediate_size, hidden_size);
+            linear_bf16(cublas.get(), device_activated.get(), layer_weight.down_proj.get(), device_projection.get(), query_tokens, inference::qwen3_0_6b_mlp_intermediate_size, hidden_size);
             cuda_check(inference::launch_residual_add(device_hidden.get(), device_projection.get(), query_tokens, hidden_size), "MLP residual");
         }
 
