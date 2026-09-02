@@ -85,7 +85,8 @@ std::vector<float> reference_attention(const std::vector<__nv_bfloat16>& query,
 
 void test_attention(std::int32_t query_tokens, std::int32_t key_value_tokens,
                     std::int32_t query_start, std::int32_t query_heads,
-                    std::int32_t key_value_heads, std::int32_t head_dim) {
+                    std::int32_t key_value_heads, std::int32_t head_dim,
+                    bool append_last_cache_token = false) {
     const std::size_t query_count = static_cast<std::size_t>(query_tokens) * query_heads * head_dim;
     const std::size_t cache_count = static_cast<std::size_t>(key_value_tokens) * key_value_heads * head_dim;
     std::vector<__nv_bfloat16> query(query_count), keys(cache_count), values(cache_count);
@@ -107,8 +108,31 @@ void test_attention(std::int32_t query_tokens, std::int32_t key_value_tokens,
     DeviceBuffer<__nv_bfloat16> device_values(values.size());
     DeviceBuffer<__nv_bfloat16> device_output(query.size());
     cuda_check(cudaMemcpy(device_query.get(), query.data(), query.size() * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice), "query H2D");
-    cuda_check(cudaMemcpy(device_keys.get(), keys.data(), keys.size() * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice), "keys H2D");
-    cuda_check(cudaMemcpy(device_values.get(), values.data(), values.size() * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice), "values H2D");
+    if (append_last_cache_token) {
+        const std::size_t values_per_token =
+            static_cast<std::size_t>(key_value_heads) * head_dim;
+        const std::size_t prefix_values =
+            static_cast<std::size_t>(key_value_tokens - 1) * values_per_token;
+        cuda_check(cudaMemcpy(device_keys.get(), keys.data(),
+                              prefix_values * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice),
+                   "key cache prefix H2D");
+        cuda_check(cudaMemcpy(device_values.get(), values.data(),
+                              prefix_values * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice),
+                   "value cache prefix H2D");
+        cuda_check(cudaMemcpy(device_keys.get() + prefix_values, keys.data() + prefix_values,
+                              values_per_token * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice),
+                   "append key cache token H2D");
+        cuda_check(cudaMemcpy(device_values.get() + prefix_values, values.data() + prefix_values,
+                              values_per_token * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice),
+                   "append value cache token H2D");
+    } else {
+        cuda_check(cudaMemcpy(device_keys.get(), keys.data(),
+                              keys.size() * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice),
+                   "keys H2D");
+        cuda_check(cudaMemcpy(device_values.get(), values.data(),
+                              values.size() * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice),
+                   "values H2D");
+    }
     cuda_check(inference::launch_causal_attention(device_query.get(), device_keys.get(), device_values.get(),
                                                   device_output.get(), query_tokens, key_value_tokens,
                                                   query_start, query_heads, key_value_heads, head_dim, scale),
@@ -149,6 +173,9 @@ int main() {
         test_attention(1, 3, 2, inference::qwen3_0_6b_attention.query_heads,
                        inference::qwen3_0_6b_attention.key_value_heads,
                        inference::qwen3_0_6b_attention.head_dim);
+        // Match main's decode path: preserve a prefix, append one token at the
+        // token-major cache offset, then attend over the complete cache.
+        test_attention(1, 4, 3, 4, 2, 8, true);
         test_invalid_arguments();
         std::cout << "attention_test: PASS\n";
         return 0;

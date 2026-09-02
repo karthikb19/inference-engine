@@ -36,5 +36,6 @@ For a prompt-to-text demo, activate the local Python environment containing
 python python/chat_infer.py --max-new-tokens 32 "What is the capital of France?"
 ```
 
-The helper prints the chat-template input token IDs, runs greedy repeated
-prefill through `build/embedding_gpu`, and decodes the generated token IDs.
+The helper prints the chat-template input token IDs, runs one prompt prefill,
+then performs greedy one-token decoding with a persistent per-layer GPU KV
+cache. It finally decodes the generated token IDs back to text.

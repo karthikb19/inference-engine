@@ -215,7 +215,40 @@ int main(int argc, char** argv) {
         print_shape(attention_norm.shape);
         std::cout << ", bytes=" << attention_norm.byte_size() << '\n';
 
-        for (std::int32_t generated = 0; generated < max_new_tokens; ++generated) {
+        const auto prompt_tokens = token_ids.size();
+        const auto maximum_cached_tokens =
+            prompt_tokens + static_cast<std::size_t>(max_new_tokens) - 1;
+        if (maximum_cached_tokens >
+            static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
+            throw std::runtime_error("Prompt and generated tokens exceed the int32 sequence limit");
+        }
+        if (hidden_size != inference::qwen3_0_6b_hidden_size) {
+            throw std::runtime_error("This executable currently targets Qwen3-0.6B's hidden size");
+        }
+        if (vocab_size > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
+            throw std::runtime_error("Vocabulary size exceeds the cuBLAS int32 limit");
+        }
+
+        constexpr auto attention = inference::qwen3_0_6b_attention;
+        const std::size_t kv_values_per_token =
+            static_cast<std::size_t>(attention.key_value_heads) * attention.head_dim;
+        if (maximum_cached_tokens >
+            std::numeric_limits<std::size_t>::max() / kv_values_per_token) {
+            throw std::runtime_error("KV cache size overflow");
+        }
+        const std::size_t cache_values = maximum_cached_tokens * kv_values_per_token;
+
+        // One persistent K and V allocation per transformer layer. Prefill writes
+        // the prompt at offset zero; every decode pass appends exactly one token.
+        std::vector<DeviceBuffer<__nv_bfloat16>> key_caches;
+        std::vector<DeviceBuffer<__nv_bfloat16>> value_caches;
+        key_caches.reserve(qwen_layer_count);
+        value_caches.reserve(qwen_layer_count);
+        for (std::int32_t layer = 0; layer < qwen_layer_count; ++layer) {
+            key_caches.emplace_back(cache_values);
+            value_caches.emplace_back(cache_values);
+        }
+
         const auto weights = model.read_tensor(embedding_name);
         std::vector<std::int32_t> host_token_ids;
         host_token_ids.reserve(token_ids.size());
@@ -240,50 +273,34 @@ int main(int argc, char** argv) {
             return device_weight;
         };
 
-        // Device buffers and embedding H2D copy.
+        // Reusable device buffers are sized for prefill, the largest query pass.
         const auto embedding_values = embedding.byte_size() / sizeof(__nv_bfloat16);
-        const auto tokens = static_cast<std::int32_t>(host_token_ids.size());
-        const auto output_values = host_token_ids.size() * static_cast<std::size_t>(hidden_size);
+        const auto maximum_query_tokens = static_cast<std::int32_t>(prompt_tokens);
+        const auto output_values = prompt_tokens * static_cast<std::size_t>(hidden_size);
+        const std::size_t query_values = prompt_tokens * attention.query_heads * attention.head_dim;
+        const std::size_t new_key_value_values = prompt_tokens * kv_values_per_token;
+        const std::size_t intermediate_values =
+            prompt_tokens * inference::qwen3_0_6b_mlp_intermediate_size;
         DeviceBuffer<__nv_bfloat16> device_embedding(embedding_values);
-        DeviceBuffer<std::int32_t> device_token_ids(host_token_ids.size());
+        DeviceBuffer<std::int32_t> device_token_ids(prompt_tokens);
         DeviceBuffer<__nv_bfloat16> device_hidden(output_values);
         DeviceBuffer<__nv_bfloat16> device_normed(output_values);
-        cuda_check(cudaMemcpy(device_embedding.get(), weights.data(), weights.size(), cudaMemcpyHostToDevice),
-                   "cudaMemcpy embedding table H2D");
-        cuda_check(cudaMemcpy(device_token_ids.get(), host_token_ids.data(),
-                              host_token_ids.size() * sizeof(std::int32_t), cudaMemcpyHostToDevice),
-                   "cudaMemcpy token IDs H2D");
-        cudaEvent_t start_event = nullptr;
-        cudaEvent_t stop_event = nullptr;
-        cuda_check(cudaEventCreate(&start_event), "cudaEventCreate start");
-        cuda_check(cudaEventCreate(&stop_event), "cudaEventCreate stop");
-        cuda_check(cudaEventRecord(start_event), "cudaEventRecord start");
-        cuda_check(inference::launch_embedding_gather(
-                       device_embedding.get(), device_token_ids.get(), device_hidden.get(), tokens,
-                       static_cast<std::int32_t>(hidden_size)),
-                   "launch_embedding_gather");
-
-        if (hidden_size != inference::qwen3_0_6b_hidden_size) {
-            throw std::runtime_error("This executable currently targets Qwen3-0.6B's hidden size");
-        }
-        constexpr auto attention = inference::qwen3_0_6b_attention;
-        const std::size_t query_values = static_cast<std::size_t>(tokens) * attention.query_heads * attention.head_dim;
-        const std::size_t key_value_values = static_cast<std::size_t>(tokens) * attention.key_value_heads * attention.head_dim;
-        const std::size_t intermediate_values = static_cast<std::size_t>(tokens) * inference::qwen3_0_6b_mlp_intermediate_size;
         DeviceBuffer<__nv_bfloat16> device_query(query_values);
-        DeviceBuffer<__nv_bfloat16> device_key(key_value_values);
-        DeviceBuffer<__nv_bfloat16> device_value(key_value_values);
+        DeviceBuffer<__nv_bfloat16> device_key(new_key_value_values);
+        DeviceBuffer<__nv_bfloat16> device_value(new_key_value_values);
         DeviceBuffer<__nv_bfloat16> device_attention(query_values);
         DeviceBuffer<__nv_bfloat16> device_projection(output_values);
         DeviceBuffer<__nv_bfloat16> device_gate(intermediate_values);
         DeviceBuffer<__nv_bfloat16> device_up(intermediate_values);
         DeviceBuffer<__nv_bfloat16> device_activated(intermediate_values);
+        DeviceBuffer<__nv_bfloat16> device_logits(vocab_size);
+        cuda_check(cudaMemcpy(device_embedding.get(), weights.data(), weights.size(), cudaMemcpyHostToDevice),
+                   "cudaMemcpy embedding table H2D");
 
-        std::vector<std::int32_t> positions(tokens);
-        std::vector<float> rope_cos(static_cast<std::size_t>(tokens) * (attention.head_dim / 2));
+        std::vector<float> rope_cos(maximum_cached_tokens * (attention.head_dim / 2));
         std::vector<float> rope_sin(rope_cos.size());
-        for (std::int32_t position = 0; position < tokens; ++position) {
-            positions[position] = position;
+        for (std::int32_t position = 0;
+             position < static_cast<std::int32_t>(maximum_cached_tokens); ++position) {
             for (std::int32_t dim = 0; dim < attention.head_dim / 2; ++dim) {
                 const float inverse_frequency = std::pow(attention.rope_theta,
                     -2.0F * static_cast<float>(dim) / static_cast<float>(attention.head_dim));
@@ -292,14 +309,51 @@ int main(int argc, char** argv) {
                 rope_sin[static_cast<std::size_t>(position) * (attention.head_dim / 2) + dim] = std::sin(angle);
             }
         }
-        DeviceBuffer<std::int32_t> device_positions(positions.size());
+        DeviceBuffer<std::int32_t> device_positions(prompt_tokens);
         DeviceBuffer<float> device_rope_cos(rope_cos.size());
         DeviceBuffer<float> device_rope_sin(rope_sin.size());
-        cuda_check(cudaMemcpy(device_positions.get(), positions.data(), positions.size() * sizeof(std::int32_t), cudaMemcpyHostToDevice), "cudaMemcpy positions H2D");
         cuda_check(cudaMemcpy(device_rope_cos.get(), rope_cos.data(), rope_cos.size() * sizeof(float), cudaMemcpyHostToDevice), "cudaMemcpy RoPE cos H2D");
         cuda_check(cudaMemcpy(device_rope_sin.get(), rope_sin.data(), rope_sin.size() * sizeof(float), cudaMemcpyHostToDevice), "cudaMemcpy RoPE sin H2D");
 
         CublasHandle cublas;
+        const auto final_norm = upload_bf16("model.norm.weight", {hidden_size});
+        const auto lm_head = upload_bf16("lm_head.weight", {vocab_size, hidden_size});
+        std::vector<__nv_bfloat16> last_logits(vocab_size);
+
+        for (std::int32_t generated = 0; generated < max_new_tokens; ++generated) {
+        const bool is_prefill = generated == 0;
+        const auto query_tokens = is_prefill ? maximum_query_tokens : 1;
+        const auto query_start_position = is_prefill
+            ? 0
+            : static_cast<std::int32_t>(prompt_tokens) + generated - 1;
+        const auto key_value_tokens = query_start_position + query_tokens;
+
+        std::vector<std::int32_t> positions(query_tokens);
+        std::iota(positions.begin(), positions.end(), query_start_position);
+        if (is_prefill) {
+            cuda_check(cudaMemcpy(device_token_ids.get(), host_token_ids.data(),
+                                  prompt_tokens * sizeof(std::int32_t), cudaMemcpyHostToDevice),
+                       "cudaMemcpy prefill token IDs H2D");
+        } else {
+            const auto decode_token = static_cast<std::int32_t>(token_ids.back());
+            cuda_check(cudaMemcpy(device_token_ids.get(), &decode_token, sizeof(decode_token),
+                                  cudaMemcpyHostToDevice),
+                       "cudaMemcpy decode token ID H2D");
+        }
+        cuda_check(cudaMemcpy(device_positions.get(), positions.data(),
+                              positions.size() * sizeof(std::int32_t), cudaMemcpyHostToDevice),
+                   "cudaMemcpy positions H2D");
+
+        cudaEvent_t start_event = nullptr;
+        cudaEvent_t stop_event = nullptr;
+        cuda_check(cudaEventCreate(&start_event), "cudaEventCreate start");
+        cuda_check(cudaEventCreate(&stop_event), "cudaEventCreate stop");
+        cuda_check(cudaEventRecord(start_event), "cudaEventRecord start");
+        cuda_check(inference::launch_embedding_gather(
+                       device_embedding.get(), device_token_ids.get(), device_hidden.get(), query_tokens,
+                       static_cast<std::int32_t>(hidden_size)),
+                   "launch_embedding_gather");
+
         for (std::int32_t layer = 0; layer < qwen_layer_count; ++layer) {
             const auto input_norm = upload_bf16(layer_tensor_name(layer, "input_layernorm.weight"), {hidden_size});
             const auto q_weight = upload_bf16(layer_tensor_name(layer, "self_attn.q_proj.weight"), {attention.query_heads * attention.head_dim, hidden_size});
@@ -309,51 +363,63 @@ int main(int argc, char** argv) {
             const auto q_norm = upload_bf16(layer_tensor_name(layer, "self_attn.q_norm.weight"), {attention.head_dim});
             const auto k_norm = upload_bf16(layer_tensor_name(layer, "self_attn.k_norm.weight"), {attention.head_dim});
 
-            cuda_check(inference::launch_rms_norm(device_hidden.get(), input_norm.get(), device_normed.get(), tokens, hidden_size, rms_norm_epsilon), "attention RMSNorm");
-            linear_bf16(cublas.get(), device_normed.get(), q_weight.get(), device_query.get(), tokens, hidden_size, attention.query_heads * attention.head_dim);
-            linear_bf16(cublas.get(), device_normed.get(), k_weight.get(), device_key.get(), tokens, hidden_size, attention.key_value_heads * attention.head_dim);
-            linear_bf16(cublas.get(), device_normed.get(), v_weight.get(), device_value.get(), tokens, hidden_size, attention.key_value_heads * attention.head_dim);
-            cuda_check(inference::launch_rms_norm(device_query.get(), q_norm.get(), device_query.get(), tokens * attention.query_heads, attention.head_dim, rms_norm_epsilon), "Q RMSNorm");
-            cuda_check(inference::launch_rms_norm(device_key.get(), k_norm.get(), device_key.get(), tokens * attention.key_value_heads, attention.head_dim, rms_norm_epsilon), "K RMSNorm");
-            cuda_check(inference::launch_rope(device_query.get(), device_positions.get(), device_rope_cos.get(), device_rope_sin.get(), device_query.get(), tokens, attention.query_heads, attention.head_dim), "Q RoPE");
-            cuda_check(inference::launch_rope(device_key.get(), device_positions.get(), device_rope_cos.get(), device_rope_sin.get(), device_key.get(), tokens, attention.key_value_heads, attention.head_dim), "K RoPE");
-            cuda_check(inference::launch_causal_attention(device_query.get(), device_key.get(), device_value.get(), device_attention.get(), tokens, tokens, 0, attention.query_heads, attention.key_value_heads, attention.head_dim, inference::qwen3_0_6b_attention_scale), "causal attention");
-            linear_bf16(cublas.get(), device_attention.get(), o_weight.get(), device_projection.get(), tokens, attention.query_heads * attention.head_dim, hidden_size);
-            cuda_check(inference::launch_residual_add(device_hidden.get(), device_projection.get(), tokens, hidden_size), "attention residual");
+            cuda_check(inference::launch_rms_norm(device_hidden.get(), input_norm.get(), device_normed.get(), query_tokens, hidden_size, rms_norm_epsilon), "attention RMSNorm");
+            linear_bf16(cublas.get(), device_normed.get(), q_weight.get(), device_query.get(), query_tokens, hidden_size, attention.query_heads * attention.head_dim);
+            linear_bf16(cublas.get(), device_normed.get(), k_weight.get(), device_key.get(), query_tokens, hidden_size, attention.key_value_heads * attention.head_dim);
+            linear_bf16(cublas.get(), device_normed.get(), v_weight.get(), device_value.get(), query_tokens, hidden_size, attention.key_value_heads * attention.head_dim);
+            cuda_check(inference::launch_rms_norm(device_query.get(), q_norm.get(), device_query.get(), query_tokens * attention.query_heads, attention.head_dim, rms_norm_epsilon), "Q RMSNorm");
+            cuda_check(inference::launch_rms_norm(device_key.get(), k_norm.get(), device_key.get(), query_tokens * attention.key_value_heads, attention.head_dim, rms_norm_epsilon), "K RMSNorm");
+            cuda_check(inference::launch_rope(device_query.get(), device_positions.get(), device_rope_cos.get(), device_rope_sin.get(), device_query.get(), query_tokens, attention.query_heads, attention.head_dim), "Q RoPE");
+            cuda_check(inference::launch_rope(device_key.get(), device_positions.get(), device_rope_cos.get(), device_rope_sin.get(), device_key.get(), query_tokens, attention.key_value_heads, attention.head_dim), "K RoPE");
+
+            const auto cache_offset = static_cast<std::size_t>(query_start_position) * kv_values_per_token;
+            const auto append_bytes = static_cast<std::size_t>(query_tokens) *
+                                      kv_values_per_token * sizeof(__nv_bfloat16);
+            cuda_check(cudaMemcpyAsync(key_caches[layer].get() + cache_offset, device_key.get(),
+                                       append_bytes, cudaMemcpyDeviceToDevice),
+                       "append key cache");
+            cuda_check(cudaMemcpyAsync(value_caches[layer].get() + cache_offset, device_value.get(),
+                                       append_bytes, cudaMemcpyDeviceToDevice),
+                       "append value cache");
+            cuda_check(inference::launch_causal_attention(device_query.get(), key_caches[layer].get(), value_caches[layer].get(), device_attention.get(), query_tokens, key_value_tokens, query_start_position, attention.query_heads, attention.key_value_heads, attention.head_dim, inference::qwen3_0_6b_attention_scale), "causal attention");
+            linear_bf16(cublas.get(), device_attention.get(), o_weight.get(), device_projection.get(), query_tokens, attention.query_heads * attention.head_dim, hidden_size);
+            cuda_check(inference::launch_residual_add(device_hidden.get(), device_projection.get(), query_tokens, hidden_size), "attention residual");
 
             const auto post_norm = upload_bf16(layer_tensor_name(layer, "post_attention_layernorm.weight"), {hidden_size});
             const auto gate_weight = upload_bf16(layer_tensor_name(layer, "mlp.gate_proj.weight"), {inference::qwen3_0_6b_mlp_intermediate_size, hidden_size});
             const auto up_weight = upload_bf16(layer_tensor_name(layer, "mlp.up_proj.weight"), {inference::qwen3_0_6b_mlp_intermediate_size, hidden_size});
             const auto down_weight = upload_bf16(layer_tensor_name(layer, "mlp.down_proj.weight"), {hidden_size, inference::qwen3_0_6b_mlp_intermediate_size});
-            cuda_check(inference::launch_rms_norm(device_hidden.get(), post_norm.get(), device_normed.get(), tokens, hidden_size, rms_norm_epsilon), "MLP RMSNorm");
-            linear_bf16(cublas.get(), device_normed.get(), gate_weight.get(), device_gate.get(), tokens, hidden_size, inference::qwen3_0_6b_mlp_intermediate_size);
-            linear_bf16(cublas.get(), device_normed.get(), up_weight.get(), device_up.get(), tokens, hidden_size, inference::qwen3_0_6b_mlp_intermediate_size);
-            cuda_check(inference::launch_swiglu(device_gate.get(), device_up.get(), device_activated.get(), tokens, inference::qwen3_0_6b_mlp_intermediate_size), "SwiGLU");
-            linear_bf16(cublas.get(), device_activated.get(), down_weight.get(), device_projection.get(), tokens, inference::qwen3_0_6b_mlp_intermediate_size, hidden_size);
-            cuda_check(inference::launch_residual_add(device_hidden.get(), device_projection.get(), tokens, hidden_size), "MLP residual");
+            cuda_check(inference::launch_rms_norm(device_hidden.get(), post_norm.get(), device_normed.get(), query_tokens, hidden_size, rms_norm_epsilon), "MLP RMSNorm");
+            linear_bf16(cublas.get(), device_normed.get(), gate_weight.get(), device_gate.get(), query_tokens, hidden_size, inference::qwen3_0_6b_mlp_intermediate_size);
+            linear_bf16(cublas.get(), device_normed.get(), up_weight.get(), device_up.get(), query_tokens, hidden_size, inference::qwen3_0_6b_mlp_intermediate_size);
+            cuda_check(inference::launch_swiglu(device_gate.get(), device_up.get(), device_activated.get(), query_tokens, inference::qwen3_0_6b_mlp_intermediate_size), "SwiGLU");
+            linear_bf16(cublas.get(), device_activated.get(), down_weight.get(), device_projection.get(), query_tokens, inference::qwen3_0_6b_mlp_intermediate_size, hidden_size);
+            cuda_check(inference::launch_residual_add(device_hidden.get(), device_projection.get(), query_tokens, hidden_size), "MLP residual");
         }
 
-        const auto final_norm = upload_bf16("model.norm.weight", {hidden_size});
-        const auto lm_head = upload_bf16("lm_head.weight", {vocab_size, hidden_size});
-        DeviceBuffer<__nv_bfloat16> device_logits(static_cast<std::size_t>(tokens) * vocab_size);
-        cuda_check(inference::launch_rms_norm(device_hidden.get(), final_norm.get(), device_normed.get(), tokens, hidden_size, rms_norm_epsilon), "final RMSNorm");
-        linear_bf16(cublas.get(), device_normed.get(), lm_head.get(), device_logits.get(), tokens, hidden_size, static_cast<std::int32_t>(vocab_size));
+        // Generation only consumes the final query row, so avoid materializing
+        // prompt-length logits during prefill.
+        const auto last_hidden_offset = static_cast<std::size_t>(query_tokens - 1) * hidden_size;
+        cuda_check(inference::launch_rms_norm(device_hidden.get() + last_hidden_offset,
+                                              final_norm.get(), device_normed.get(), 1,
+                                              hidden_size, rms_norm_epsilon), "final RMSNorm");
+        linear_bf16(cublas.get(), device_normed.get(), lm_head.get(), device_logits.get(),
+                    1, hidden_size, static_cast<std::int32_t>(vocab_size));
         cuda_check(cudaEventRecord(stop_event), "cudaEventRecord stop");
         cuda_check(cudaEventSynchronize(stop_event), "cudaEventSynchronize stop");
-        float prefill_milliseconds = 0.0F;
-        cuda_check(cudaEventElapsedTime(&prefill_milliseconds, start_event, stop_event), "cudaEventElapsedTime");
+        float pass_milliseconds = 0.0F;
+        cuda_check(cudaEventElapsedTime(&pass_milliseconds, start_event, stop_event), "cudaEventElapsedTime");
 
-        std::vector<__nv_bfloat16> last_logits(vocab_size);
-        cuda_check(cudaMemcpy(last_logits.data(), device_logits.get() + static_cast<std::size_t>(tokens - 1) * vocab_size,
+        cuda_check(cudaMemcpy(last_logits.data(), device_logits.get(),
                               vocab_size * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost), "cudaMemcpy logits D2H");
         const auto next_token = static_cast<std::size_t>(std::max_element(last_logits.begin(), last_logits.end(),
             [](__nv_bfloat16 left, __nv_bfloat16 right) { return __bfloat162float(left) < __bfloat162float(right); }) - last_logits.begin());
         cuda_check(cudaEventDestroy(start_event), "cudaEventDestroy start");
         cuda_check(cudaEventDestroy(stop_event), "cudaEventDestroy stop");
         std::cout << "generated token " << (generated + 1) << ": id=" << next_token
-                  << ", sequence_length=" << tokens
-                  << ", prefill_gpu_ms=" << std::fixed << std::setprecision(3)
-                  << prefill_milliseconds << '\n';
+                  << ", sequence_length=" << key_value_tokens
+                  << (is_prefill ? ", prefill_gpu_ms=" : ", decode_gpu_ms=")
+                  << std::fixed << std::setprecision(3) << pass_milliseconds << '\n';
         if (next_token == qwen_eos_token_id) {
             std::cout << "stopped on EOS token " << qwen_eos_token_id << '\n';
             break;
