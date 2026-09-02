@@ -14,6 +14,10 @@ RESIDUAL_ADD_TEST_TARGET := build/residual_add_test
 RESIDUAL_ADD_TEST_SOURCES := tests/residual_add_test.cu src/kernels.cu
 ATTENTION_TEST_TARGET := build/attention_test
 ATTENTION_TEST_SOURCES := tests/attention_test.cu src/kernels.cu
+SOFTMAX_TEST_TARGET := build/softmax_test
+SOFTMAX_TEST_SOURCES := tests/softmax_test.cu src/kernels.cu
+SWIGLU_TEST_TARGET := build/swiglu_test
+SWIGLU_TEST_SOURCES := tests/swiglu_test.cu src/kernels.cu
 TOKENS ?= 791
 
 .PHONY: all run test clean
@@ -47,11 +51,28 @@ $(ATTENTION_TEST_TARGET): $(ATTENTION_TEST_SOURCES) include/kernels.cuh
 	mkdir -p build
 	$(NVCC) -std=c++20 -arch=$(CUDA_ARCH) $(CPPFLAGS) $(ATTENTION_TEST_SOURCES) -o $@
 
-test: $(TEST_TARGET) $(RMS_NORM_TEST_TARGET) $(ROPE_TEST_TARGET) $(RESIDUAL_ADD_TEST_TARGET)
+$(SOFTMAX_TEST_TARGET): $(SOFTMAX_TEST_SOURCES) include/kernels.cuh
+	mkdir -p build
+	$(NVCC) -std=c++20 -arch=$(CUDA_ARCH) $(CPPFLAGS) $(SOFTMAX_TEST_SOURCES) -o $@
+
+$(SWIGLU_TEST_TARGET): $(SWIGLU_TEST_SOURCES) include/kernels.cuh
+	mkdir -p build
+	$(NVCC) -std=c++20 -arch=$(CUDA_ARCH) $(CPPFLAGS) $(SWIGLU_TEST_SOURCES) -o $@
+
+test: $(TEST_TARGET) $(RMS_NORM_TEST_TARGET) $(ROPE_TEST_TARGET) $(RESIDUAL_ADD_TEST_TARGET) $(SOFTMAX_TEST_TARGET) $(SWIGLU_TEST_TARGET)
 	./$(TEST_TARGET)
 	./$(RMS_NORM_TEST_TARGET)
 	./$(ROPE_TEST_TARGET)
 	./$(RESIDUAL_ADD_TEST_TARGET)
+	./$(SOFTMAX_TEST_TARGET)
+	./$(SWIGLU_TEST_TARGET)
+
+.PHONY: softmax-test swiglu-test
+softmax-test: $(SOFTMAX_TEST_TARGET)
+	./$(SOFTMAX_TEST_TARGET)
+
+swiglu-test: $(SWIGLU_TEST_TARGET)
+	./$(SWIGLU_TEST_TARGET)
 
 .PHONY: rms-norm-test
 rms-norm-test: $(RMS_NORM_TEST_TARGET)

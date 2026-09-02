@@ -28,6 +28,38 @@ inline constexpr std::int32_t qwen3_0_6b_gqa_group_size =
     qwen3_0_6b_attention.query_heads / qwen3_0_6b_attention.key_value_heads;
 inline constexpr float qwen3_0_6b_attention_scale = 0.08838834764831843F;  // 1 / sqrt(128)
 
+// Qwen3-0.6B MLP geometry. Each block projects hidden states into separate
+// gate and up tensors of this width, applies SwiGLU, then down-projects them.
+inline constexpr std::int32_t qwen3_0_6b_hidden_size = 1024;
+inline constexpr std::int32_t qwen3_0_6b_mlp_intermediate_size = 3072;
+
+// Numerically stable row-wise softmax.
+//
+//   input/output: [num_rows, row_size] FP32 logits/probabilities
+//
+// Each row is normalized independently. input and output may alias. FP32 is
+// intentional: attention scores must retain FP32 precision before the value
+// accumulation, even when model activations are BF16.
+cudaError_t launch_softmax(const float* input,
+                           float* output,
+                           std::int32_t num_rows,
+                           std::int32_t row_size,
+                           cudaStream_t stream = nullptr);
+
+// Qwen's SwiGLU MLP activation:
+//
+//   output = silu(gate) * up
+//          = gate / (1 + exp(-gate)) * up
+//
+// gate, up, and output have shape [num_tokens, intermediate_size] and contain
+// BF16 values. Computation is FP32 and output may alias either input.
+cudaError_t launch_swiglu(const __nv_bfloat16* gate,
+                          const __nv_bfloat16* up,
+                          __nv_bfloat16* output,
+                          std::int32_t num_tokens,
+                          std::int32_t intermediate_size,
+                          cudaStream_t stream = nullptr);
+
 // Device-memory contract for Qwen's token embedding lookup:
 //
 //   embedding_table: [vocab_size, hidden_size] __nv_bfloat16 values

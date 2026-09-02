@@ -10,7 +10,8 @@ The model snapshot is stored locally under `models/Qwen3-0.6B/` and is intention
   1. RMSNorm — test against a CPU FP32 reference, including epsilon.
   2. Linear/GEMM infrastructure — needed for Q/K/V and MLP projections.
   3. RoPE, causal GQA attention, residual adds.
-  4. SwiGLU MLP.
+  4. SwiGLU MLP (the activation kernel is available; its gate/up/down
+     projections await the GEMM infrastructure).
   5. Final RMSNorm and LM-head projection.
 
 ```
@@ -21,3 +22,9 @@ kernel exercise lives in `causal_attention_kernel` in `src/kernels.cu`; its
 contract and independent FP32 reference are in `tests/attention_test.cu`.
 Run `make attention-test` while implementing it. The test is deliberately not
 included in `make test` until the kernel body is completed.
+
+`launch_softmax` provides stable FP32 row softmax for attention logits.
+Qwen3-0.6B's MLP is SwiGLU rather than a standalone SiLU: after the gate and
+up projections, invoke `launch_swiglu(gate, up, activated, tokens, 3072)`,
+then pass `activated` to the down projection. Run `make softmax-test` and
+`make swiglu-test` for the kernel-specific checks.

@@ -5,6 +5,88 @@
 
 namespace inference {
 
+__global__ void softmax_kernel(const float* input,
+                               float* output,
+                               std::int32_t row_size) {
+    extern __shared__ float reduction[];
+    const std::int32_t row = blockIdx.x;
+    const std::int32_t tid = threadIdx.x;
+    const std::int64_t base = static_cast<std::int64_t>(row) * row_size;
+
+    float local_max = -INFINITY;
+    for (std::int32_t column = tid; column < row_size; column += blockDim.x) {
+        local_max = fmaxf(local_max, input[base + column]);
+    }
+    reduction[tid] = local_max;
+    __syncthreads();
+    for (std::int32_t active = blockDim.x / 2; active > 0; active >>= 1) {
+        if (tid < active) reduction[tid] = fmaxf(reduction[tid], reduction[tid + active]);
+        __syncthreads();
+    }
+    const float maximum = reduction[0];
+
+    float local_sum = 0.0F;
+    for (std::int32_t column = tid; column < row_size; column += blockDim.x) {
+        local_sum += expf(input[base + column] - maximum);
+    }
+    reduction[tid] = local_sum;
+    __syncthreads();
+    for (std::int32_t active = blockDim.x / 2; active > 0; active >>= 1) {
+        if (tid < active) reduction[tid] += reduction[tid + active];
+        __syncthreads();
+    }
+    const float inverse_sum = 1.0F / reduction[0];
+    for (std::int32_t column = tid; column < row_size; column += blockDim.x) {
+        output[base + column] = expf(input[base + column] - maximum) * inverse_sum;
+    }
+}
+
+cudaError_t launch_softmax(const float* input,
+                           float* output,
+                           std::int32_t num_rows,
+                           std::int32_t row_size,
+                           cudaStream_t stream) {
+    if (input == nullptr || output == nullptr || num_rows <= 0 || row_size <= 0) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr std::int32_t threads_per_block = 256;
+    softmax_kernel<<<num_rows, threads_per_block,
+                     threads_per_block * sizeof(float), stream>>>(input, output, row_size);
+    return cudaGetLastError();
+}
+
+__global__ void swiglu_kernel(const __nv_bfloat16* gate,
+                              const __nv_bfloat16* up,
+                              __nv_bfloat16* output,
+                              std::int64_t total_elements) {
+    const std::int64_t index = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= total_elements) return;
+
+    const float gate_value = __bfloat162float(gate[index]);
+    const float up_value = __bfloat162float(up[index]);
+    const float silu = gate_value / (1.0F + expf(-gate_value));
+    output[index] = __float2bfloat16(silu * up_value);
+}
+
+cudaError_t launch_swiglu(const __nv_bfloat16* gate,
+                          const __nv_bfloat16* up,
+                          __nv_bfloat16* output,
+                          std::int32_t num_tokens,
+                          std::int32_t intermediate_size,
+                          cudaStream_t stream) {
+    if (gate == nullptr || up == nullptr || output == nullptr || num_tokens <= 0 ||
+        intermediate_size <= 0) {
+        return cudaErrorInvalidValue;
+    }
+    constexpr std::int32_t threads_per_block = 256;
+    const std::int64_t total_elements = static_cast<std::int64_t>(num_tokens) * intermediate_size;
+    const std::int64_t blocks = (total_elements + threads_per_block - 1) / threads_per_block;
+    if (blocks > std::numeric_limits<unsigned int>::max()) return cudaErrorInvalidValue;
+    swiglu_kernel<<<static_cast<unsigned int>(blocks), threads_per_block, 0, stream>>>(
+        gate, up, output, total_elements);
+    return cudaGetLastError();
+}
+
 // Embedding gather kernel
 // Qwen3-0.6B embedding_table dimensions: [151936 vocabulary tokens, 1024 hidden values]
 // Each entry is BF16, so the table is 311,164,928 bytes.
