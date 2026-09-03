@@ -4,6 +4,11 @@ This project is currently focused on implementing inference for `Qwen/Qwen3-0.6B
 
 The model snapshot is stored locally under `models/Qwen3-0.6B/` and is intentionally excluded from git.
 
+The command-line and chat/tokenizer flow lives in `src/main.cpp`. Model loading,
+GPU buffer management, prefill, KV-cached decoding, and greedy token selection
+are exposed through `InferenceEngine` in `src/inference_engine.cpp`. CUDA kernel
+implementations remain in `src/kernels.cu`.
+
 
 ```
 
@@ -29,15 +34,17 @@ up projections, invoke `launch_swiglu(gate, up, activated, tokens, 3072)`,
 then pass `activated` to the down projection. Run `make softmax-test` and
 `make swiglu-test` for the kernel-specific checks.
 
-For a prompt-to-text demo, activate the local Python environment containing
-`transformers` and run:
+For a prompt-to-text demo, build and run the C++ executable directly:
 
 ```
-python python/chat_infer.py --max-new-tokens 32 "What is the capital of France?"
+make
+./build/embedding_gpu --max-new-tokens 32 --prompt "What is the capital of France?"
 ```
 
-The helper prints the chat-template input token IDs, runs one prompt prefill,
+The executable reads the Qwen tokenizer, applies the non-thinking chat template,
+prints the input token IDs, runs one prompt prefill,
 then performs greedy one-token decoding with a persistent per-layer GPU KV
 cache. Model weights are uploaded to GPU memory once before inference and stay
-resident across both phases. The helper finally decodes the generated token
-IDs back to text.
+resident across both phases. It finally prints both the generated token IDs and
+their decoded text. `--tokens ID...` remains available for tokenizer-independent
+debugging.

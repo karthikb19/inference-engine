@@ -1,10 +1,12 @@
 NVCC ?= nvcc
+CXX ?= g++
 CPPFLAGS := -Iinclude
 CUDA_ARCH ?= sm_89
-LDLIBS := -lcublas
+LDLIBS := -lcublas -lpcre2-8 -licuuc
+TOKENIZER_LDLIBS := -lpcre2-8 -licuuc
 
 TARGET := build/embedding_gpu
-SOURCES := src/main.cpp src/safetensor.cpp src/kernels.cu
+SOURCES := src/main.cpp src/inference_engine.cpp src/safetensor.cpp src/tokenizer.cpp src/kernels.cu
 TEST_TARGET := build/embedding_gather_test
 TEST_SOURCES := tests/embedding_gather_test.cu src/kernels.cu
 RMS_NORM_TEST_TARGET := build/rms_norm_test
@@ -19,6 +21,8 @@ SOFTMAX_TEST_TARGET := build/softmax_test
 SOFTMAX_TEST_SOURCES := tests/softmax_test.cu src/kernels.cu
 SWIGLU_TEST_TARGET := build/swiglu_test
 SWIGLU_TEST_SOURCES := tests/swiglu_test.cu src/kernels.cu
+TOKENIZER_TEST_TARGET := build/tokenizer_test
+TOKENIZER_TEST_SOURCES := tests/tokenizer_test.cpp src/tokenizer.cpp
 TOKENS ?= 791
 
 .PHONY: all run test clean
@@ -28,7 +32,7 @@ all: $(TARGET)
 run: $(TARGET)
 	./$(TARGET) --tokens $(TOKENS)
 
-$(TARGET): $(SOURCES) include/safetensor.hpp include/kernels.cuh include/json.hpp
+$(TARGET): $(SOURCES) include/inference_engine.hpp include/safetensor.hpp include/tokenizer.hpp include/kernels.cuh include/json.hpp
 	mkdir -p build
 	$(NVCC) -std=c++20 -arch=$(CUDA_ARCH) $(CPPFLAGS) $(SOURCES) -o $@ $(LDLIBS)
 
@@ -60,13 +64,18 @@ $(SWIGLU_TEST_TARGET): $(SWIGLU_TEST_SOURCES) include/kernels.cuh
 	mkdir -p build
 	$(NVCC) -std=c++20 -arch=$(CUDA_ARCH) $(CPPFLAGS) $(SWIGLU_TEST_SOURCES) -o $@ $(LDLIBS)
 
-test: $(TEST_TARGET) $(RMS_NORM_TEST_TARGET) $(ROPE_TEST_TARGET) $(RESIDUAL_ADD_TEST_TARGET) $(SOFTMAX_TEST_TARGET) $(SWIGLU_TEST_TARGET)
+$(TOKENIZER_TEST_TARGET): $(TOKENIZER_TEST_SOURCES) include/tokenizer.hpp include/json.hpp
+	mkdir -p build
+	$(CXX) -std=c++20 $(CPPFLAGS) $(TOKENIZER_TEST_SOURCES) -o $@ $(TOKENIZER_LDLIBS)
+
+test: $(TEST_TARGET) $(RMS_NORM_TEST_TARGET) $(ROPE_TEST_TARGET) $(RESIDUAL_ADD_TEST_TARGET) $(SOFTMAX_TEST_TARGET) $(SWIGLU_TEST_TARGET) $(TOKENIZER_TEST_TARGET)
 	./$(TEST_TARGET)
 	./$(RMS_NORM_TEST_TARGET)
 	./$(ROPE_TEST_TARGET)
 	./$(RESIDUAL_ADD_TEST_TARGET)
 	./$(SOFTMAX_TEST_TARGET)
 	./$(SWIGLU_TEST_TARGET)
+	./$(TOKENIZER_TEST_TARGET)
 
 .PHONY: softmax-test swiglu-test
 softmax-test: $(SOFTMAX_TEST_TARGET)
@@ -74,6 +83,10 @@ softmax-test: $(SOFTMAX_TEST_TARGET)
 
 swiglu-test: $(SWIGLU_TEST_TARGET)
 	./$(SWIGLU_TEST_TARGET)
+
+.PHONY: tokenizer-test
+tokenizer-test: $(TOKENIZER_TEST_TARGET)
+	./$(TOKENIZER_TEST_TARGET)
 
 .PHONY: rms-norm-test
 rms-norm-test: $(RMS_NORM_TEST_TARGET)
