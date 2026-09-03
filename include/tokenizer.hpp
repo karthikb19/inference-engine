@@ -10,6 +10,11 @@
 
 namespace inference {
 
+struct ChatMessage {
+    std::string role;
+    std::string content;
+};
+
 class Tokenizer {
 public:
     explicit Tokenizer(const std::filesystem::path& tokenizer_path);
@@ -33,6 +38,11 @@ private:
 // Qwen3's single-turn user chat format with an assistant generation prompt.
 [[nodiscard]] std::string format_qwen3_chat_prompt(
     std::string_view user_prompt,
+    bool enable_thinking = false);
+
+// Formats complete chat history and appends the assistant generation prompt.
+[[nodiscard]] std::string format_qwen3_chat_prompt(
+    std::span<const ChatMessage> messages,
     bool enable_thinking = false);
 
 }  // namespace inference

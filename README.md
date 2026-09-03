@@ -41,6 +41,14 @@ make
 ./build/embedding_gpu --max-new-tokens 32 --prompt "What is the capital of France?"
 ```
 
+Run without a prompt (or pass `--chat`) for an interactive, multi-turn chat:
+
+```
+./build/embedding_gpu --chat --max-new-tokens 64
+```
+
+Use `/clear` to reset conversation history and `/quit` to exit.
+
 The executable reads the Qwen tokenizer, applies the non-thinking chat template,
 prints the input token IDs, runs one prompt prefill,
 then performs greedy one-token decoding with a persistent per-layer GPU KV

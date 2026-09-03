@@ -44,6 +44,21 @@ int main() {
         expect(tokenizer.decode(std::vector<std::int32_t>{151644, 9707, 151645}) == "Hello",
                "special-token skipping failed");
 
+        const std::vector<inference::ChatMessage> history{
+            {.role = "user", .content = "Hello"},
+            {.role = "assistant", .content = "Hi!"},
+            {.role = "user", .content = "How are you?"},
+        };
+        const std::string expected_history =
+            "<|im_start|>user\nHello<|im_end|>\n"
+            "<|im_start|>assistant\nHi!<|im_end|>\n"
+            "<|im_start|>user\nHow are you?<|im_end|>\n"
+            "<|im_start|>assistant\n<think>\n\n</think>\n\n";
+        const auto formatted_history = inference::format_qwen3_chat_prompt(history);
+        expect(formatted_history == expected_history, "multi-turn chat formatting failed");
+        expect(tokenizer.decode(tokenizer.encode(formatted_history), false) == expected_history,
+               "multi-turn chat prompt did not round-trip");
+
         std::cout << "tokenizer test passed\n";
         return 0;
     } catch (const std::exception& error) {

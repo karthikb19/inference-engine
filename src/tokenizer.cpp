@@ -367,9 +367,27 @@ std::string Tokenizer::decode(std::span<const std::int32_t> token_ids,
 }
 
 std::string format_qwen3_chat_prompt(std::string_view user_prompt, bool enable_thinking) {
-    std::string result = "<|im_start|>user\n";
-    result.append(user_prompt);
-    result += "<|im_end|>\n<|im_start|>assistant\n";
+    const std::array messages{ChatMessage{.role = "user", .content = std::string(user_prompt)}};
+    return format_qwen3_chat_prompt(messages, enable_thinking);
+}
+
+std::string format_qwen3_chat_prompt(std::span<const ChatMessage> messages,
+                                     bool enable_thinking) {
+    if (messages.empty()) throw std::runtime_error("Chat history cannot be empty");
+
+    std::string result;
+    for (const auto& message : messages) {
+        if (message.role != "system" && message.role != "user" &&
+            message.role != "assistant") {
+            throw std::runtime_error("Unsupported chat role: " + message.role);
+        }
+        result += "<|im_start|>";
+        result += message.role;
+        result += '\n';
+        result += message.content;
+        result += "<|im_end|>\n";
+    }
+    result += "<|im_start|>assistant\n";
     if (!enable_thinking) result += "<think>\n\n</think>\n\n";
     return result;
 }

@@ -30,7 +30,7 @@ namespace {
 void print_usage(const char* program) {
     std::cerr << "Usage: " << program
               << " [--model-dir PATH] [--model PATH] [--tokenizer PATH]"
-                 " [--max-new-tokens COUNT] (--prompt TEXT | --tokens TOKEN_ID [TOKEN_ID ...])\n";
+                 " [--max-new-tokens COUNT] [--chat | --prompt TEXT | --tokens TOKEN_ID ...]\n";
 }
 
 void print_shape(const std::vector<std::uint64_t>& shape) {
@@ -48,6 +48,46 @@ void print_tensor(const inference::TensorMetadata& tensor) {
     std::cout << ", bytes=" << tensor.bytes << '\n';
 }
 
+void run_chat(const inference::Tokenizer& tokenizer,
+              const inference::InferenceEngine& engine,
+              std::int32_t max_new_tokens) {
+    std::vector<inference::ChatMessage> history;
+    std::cout << "Qwen3 interactive chat\n"
+                 "Commands: /clear resets the conversation, /quit exits.\n\n";
+
+    std::string input;
+    while (true) {
+        std::cout << "You> " << std::flush;
+        if (!std::getline(std::cin, input)) {
+            std::cout << '\n';
+            return;
+        }
+        if (input == "/quit" || input == "/exit") return;
+        if (input == "/clear") {
+            history.clear();
+            std::cout << "Conversation cleared.\n\n";
+            continue;
+        }
+        if (input.empty()) continue;
+
+        history.push_back({.role = "user", .content = input});
+        try {
+            const auto formatted = inference::format_qwen3_chat_prompt(history);
+            const auto prompt_ids = tokenizer.encode(formatted);
+            const auto result = engine.generate(prompt_ids, max_new_tokens);
+            const auto response = tokenizer.decode(result.token_ids, true);
+            history.push_back({.role = "assistant", .content = response});
+
+            std::cout << "Assistant> " << response;
+            if (response.empty() || response.back() != '\n') std::cout << '\n';
+            std::cout << '\n';
+        } catch (const std::exception& error) {
+            history.pop_back();
+            std::cerr << "error: " << error.what() << "\n\n";
+        }
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -56,7 +96,8 @@ int main(int argc, char** argv) {
     std::filesystem::path tokenizer_path = model_directory / "tokenizer.json";
     std::vector<std::int32_t> token_ids;
     std::optional<std::string> prompt;
-    std::int32_t max_new_tokens = 1;
+    bool chat_mode = false;
+    std::int32_t max_new_tokens = 32;
 
     try {
         for (int index = 1; index < argc; ++index) {
@@ -87,6 +128,8 @@ int main(int argc, char** argv) {
                     return 1;
                 }
                 prompt = argv[index];
+            } else if (argument == "--chat") {
+                chat_mode = true;
             } else if (argument == "--max-new-tokens") {
                 if (++index == argc) {
                     print_usage(argv[0]);
@@ -110,11 +153,19 @@ int main(int argc, char** argv) {
                 return 1;
             }
         }
-        if (prompt.has_value() && !token_ids.empty()) {
-            throw std::runtime_error("Use either --prompt or --tokens, not both");
+        const auto selected_modes = static_cast<int>(chat_mode) +
+                                    static_cast<int>(prompt.has_value()) +
+                                    static_cast<int>(!token_ids.empty());
+        if (selected_modes > 1) {
+            throw std::runtime_error("Use only one of --chat, --prompt, or --tokens");
         }
 
         const inference::Tokenizer tokenizer(tokenizer_path);
+        const inference::InferenceEngine engine(model_path);
+        if (chat_mode || selected_modes == 0) {
+            run_chat(tokenizer, engine, max_new_tokens);
+            return 0;
+        }
         if (prompt.has_value()) {
             token_ids = tokenizer.encode(inference::format_qwen3_chat_prompt(*prompt));
             std::cout << "Input token IDs:\n";
@@ -129,7 +180,6 @@ int main(int argc, char** argv) {
             return 1;
         }
 
-        const inference::InferenceEngine engine(model_path);
         const auto result = engine.generate(token_ids, max_new_tokens);
 
         std::cout << "Loaded " << result.model.path << " (" << result.model.tensor_count
